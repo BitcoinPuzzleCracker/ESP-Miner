@@ -22,27 +22,9 @@ static const char *TAG = "create_jobs_task";
 #define MAX_EXTRANONCE2_LEN 32
 #define MAX_EXTRANONCE2_STR (MAX_EXTRANONCE2_LEN * 2 + 1)
 
-/* ============================================================
- *  VERSION ROLLING MAKSİMİZASYON AYARLARI
- * ============================================================ */
-
-// BIP320 tam maske (bit 13..28 = 16 bit rolling uzayı)
 #define BIP320_FULL_MASK        0x1FFFE000UL
-
-// Aynı iş için ASIC'in minimum rolling süresi (ms)
-// Bu süre dolmadan "kozmetik" yeni iş kabul edilmez.
 #define MIN_JOB_LIFETIME_MS     12000
-
-// ASIC'in aynı işte kalabileceği maksimum süre (ms)
-// Bu süre sonunda yeni iş gelmezse eski işi tekrar gönder.
 #define MAX_JOB_LIFETIME_MS     45000
-
-// Kaç midstate üretilecek (donanım destekliyorsa 4, aksi halde 1)
-#define NUM_MIDSTATES_TARGET    4
-
-/* ============================================================
- *  VERSION ROLLING İSTATİSTİK TAKİBİ
- * ============================================================ */
 
 typedef struct {
     char     job_id[64];
@@ -53,10 +35,6 @@ typedef struct {
 } rolling_stats_t;
 
 static rolling_stats_t g_rolling = {0};
-
-/* ============================================================
- *  ÖN İŞ DEĞİŞİKLİK TESPİTİ
- * ============================================================ */
 
 typedef struct {
     uint8_t  prev_hash[32];
@@ -72,11 +50,10 @@ static work_fingerprint_t g_last_fp_sv2 = {0};
 static void fp_from_v1(work_fingerprint_t *fp, const mining_notify *n)
 {
     memcpy(fp->prev_hash, n->prev_block_hash, 32);
-    if (n->n_merkle_branches > 0) {
+    if (n->n_merkle_branches > 0)
         memcpy(fp->merkle0, n->merkle_branches[0], 32);
-    } else {
+    else
         memset(fp->merkle0, 0, 32);
-    }
     fp->version = n->version;
     fp->ntime   = n->ntime;
     fp->valid   = true;
@@ -94,11 +71,10 @@ static void fp_from_sv2(work_fingerprint_t *fp, const sv2_job_t *j)
 static void fp_from_sv2_ext(work_fingerprint_t *fp, const sv2_ext_job_t *j)
 {
     memcpy(fp->prev_hash, j->prev_hash, 32);
-    if (j->merkle_path_count > 0) {
+    if (j->merkle_path_count > 0)
         memcpy(fp->merkle0, j->merkle_path[0], 32);
-    } else {
+    else
         memset(fp->merkle0, 0, 32);
-    }
     fp->version = j->version;
     fp->ntime   = j->ntime;
     fp->valid   = true;
@@ -113,25 +89,19 @@ static bool fp_equal(const work_fingerprint_t *a, const work_fingerprint_t *b)
         && a->ntime   == b->ntime;
 }
 
-/* ============================================================
- *  YARDIMCILAR
- * ============================================================ */
-
 static void free_work_item(GlobalState *GLOBAL_STATE, void *work, stratum_protocol_t protocol)
 {
     if (!work) return;
     if (protocol == STRATUM_PROTOCOL_V2) {
-        if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
+        if (stratum_v2_is_extended_channel(GLOBAL_STATE))
             sv2_ext_job_free((sv2_ext_job_t *)work);
-        } else {
+        else
             free(work);
-        }
     } else {
         STRATUM_V1_free_mining_notify(work);
     }
 }
 
-/* Ortak midstate üretim yardımcısı — rolling uzayını maksimize eder */
 static void build_midstates(bm_job *job,
                             uint32_t base_version,
                             const uint8_t *prev_hash,
@@ -141,10 +111,9 @@ static void build_midstates(bm_job *job,
     uint8_t midstate_data[64];
     uint8_t midstate[32];
 
-    // Ana midstate (base version)
-    memcpy(midstate_data,     &base_version, 4);
-    memcpy(midstate_data + 4, prev_hash,     32);
-    memcpy(midstate_data + 36, merkle_root,  28);
+    memcpy(midstate_data,      &base_version, 4);
+    memcpy(midstate_data + 4,  prev_hash,     32);
+    memcpy(midstate_data + 36, merkle_root,   28);
     midstate_sha256_bin(midstate_data, 64, midstate);
     reverse_32bit_words(midstate, job->midstate);
 
@@ -153,21 +122,13 @@ static void build_midstates(bm_job *job,
         return;
     }
 
-    // Rolling midstate'leri üret
-    uint8_t *ms_ptrs[4] = {
-        job->midstate1,
-        job->midstate2,
-        job->midstate3,
-        NULL
-    };
-
+    uint8_t *ms_ptrs[3] = { job->midstate1, job->midstate2, job->midstate3 };
     uint32_t rolled_version = base_version;
     int produced = 1;
 
     for (int i = 0; i < 3; i++) {
         rolled_version = increment_bitmask(rolled_version, version_mask);
-        if (rolled_version == base_version) break;  // tam döngü
-
+        if (rolled_version == base_version) break;
         memcpy(midstate_data, &rolled_version, 4);
         midstate_sha256_bin(midstate_data, 64, midstate);
         reverse_32bit_words(midstate, ms_ptrs[i]);
@@ -177,7 +138,6 @@ static void build_midstates(bm_job *job,
     job->num_midstates = produced;
 }
 
-/* Rolling istatistiklerini güncelle */
 static void update_rolling_stats(const char *job_id, uint32_t version)
 {
     if (strcmp(g_rolling.job_id, job_id) != 0) {
@@ -202,9 +162,9 @@ static void update_rolling_stats(const char *job_id, uint32_t version)
     }
 }
 
-/* ============================================================
- *  ANA GÖREV
- * ============================================================ */
+static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, double difficulty);
+static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *job, double difficulty);
+static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *job, double difficulty);
 
 void create_jobs_task(void *pvParameters)
 {
@@ -228,11 +188,9 @@ void create_jobs_task(void *pvParameters)
              MIN_JOB_LIFETIME_MS, MAX_JOB_LIFETIME_MS);
 
     while (1) {
-        if (GLOBAL_STATE->reset_extranonce2) {
+        if (GLOBAL_STATE->reset_extranonce2)
             GLOBAL_STATE->reset_extranonce2 = false;
-        }
 
-        /* --- Protokol değişimi kontrolü --- */
         stratum_protocol_t active_protocol = GLOBAL_STATE->stratum_protocol;
         if (active_protocol != current_work_protocol) {
             if (current_work != NULL) {
@@ -243,33 +201,28 @@ void create_jobs_task(void *pvParameters)
             current_work_protocol = active_protocol;
             last_dispatched_job_v1[0] = '\0';
             last_dispatched_job_sv2    = UINT32_MAX;
-            g_last_fp_v1.valid = false;
+            g_last_fp_v1.valid  = false;
             g_last_fp_sv2.valid = false;
         }
 
-        /* --- Kuyruktan iş çek --- */
         uint64_t start_time = esp_timer_get_time();
         void *new_work = queue_dequeue_timeout(&GLOBAL_STATE->stratum_queue, timeout_ms);
         timeout_ms -= (esp_timer_get_time() - start_time) / 1000;
         if (timeout_ms < 0) timeout_ms = 0;
 
         if (new_work == NULL) {
-            /* Timeout — eski iş varsa ASIC donanımda rolling'e devam eder */
-            if (current_work == NULL) {
+            if (current_work == NULL)
                 vTaskDelay(100 / portTICK_PERIOD_MS);
-            }
             timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
             continue;
         }
 
         active_protocol = GLOBAL_STATE->stratum_protocol;
-
-        /* --- Önceki işi serbest bırak --- */
         free_work_item(GLOBAL_STATE, current_work, current_work_protocol);
         current_work = NULL;
 
         if (active_protocol != current_work_protocol) {
-            ESP_LOGW(TAG, "Protocol switch during dequeue, discarding");
+            ESP_LOGW(TAG, "Protocol switch during dequeue");
             free(new_work);
             current_work_protocol = active_protocol;
             timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
@@ -278,7 +231,6 @@ void create_jobs_task(void *pvParameters)
 
         current_work = new_work;
 
-        /* --- Log + Kimlik + Fingerprint --- */
         bool is_new_job_id  = false;
         bool clean          = false;
         bool work_changed   = false;
@@ -289,15 +241,13 @@ void create_jobs_task(void *pvParameters)
             if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
                 sv2_ext_job_t *j = (sv2_ext_job_t *)current_work;
                 snprintf(job_id, sizeof(job_id), "%lu", (unsigned long)j->job_id);
-                clean        = j->clean_jobs;
-                job_version  = j->version;
+                clean       = j->clean_jobs;
+                job_version = j->version;
                 ESP_LOGI(TAG, "New Work Dequeued SV2 ext job %s (clean:%d)", job_id, clean);
-
                 if (last_dispatched_job_sv2 != j->job_id) {
                     is_new_job_id = true;
                     last_dispatched_job_sv2 = j->job_id;
                 }
-
                 work_fingerprint_t fp;
                 fp_from_sv2_ext(&fp, j);
                 work_changed = !fp_equal(&g_last_fp_sv2, &fp);
@@ -305,15 +255,13 @@ void create_jobs_task(void *pvParameters)
             } else {
                 sv2_job_t *j = (sv2_job_t *)current_work;
                 snprintf(job_id, sizeof(job_id), "%lu", (unsigned long)j->job_id);
-                clean        = j->clean_jobs;
-                job_version  = j->version;
+                clean       = j->clean_jobs;
+                job_version = j->version;
                 ESP_LOGI(TAG, "New Work Dequeued SV2 job %s (clean:%d)", job_id, clean);
-
                 if (last_dispatched_job_sv2 != j->job_id) {
                     is_new_job_id = true;
                     last_dispatched_job_sv2 = j->job_id;
                 }
-
                 work_fingerprint_t fp;
                 fp_from_sv2(&fp, j);
                 work_changed = !fp_equal(&g_last_fp_sv2, &fp);
@@ -322,29 +270,25 @@ void create_jobs_task(void *pvParameters)
         } else {
             mining_notify *j = (mining_notify *)current_work;
             strncpy(job_id, j->job_id, sizeof(job_id) - 1);
-            clean        = j->clean_jobs;
-            job_version  = j->version;
+            clean       = j->clean_jobs;
+            job_version = j->version;
             ESP_LOGI(TAG, "New Work Dequeued %s (clean:%s)", job_id, clean ? "true" : "false");
-
             if (strcmp(last_dispatched_job_v1, j->job_id) != 0) {
                 is_new_job_id = true;
                 strncpy(last_dispatched_job_v1, j->job_id, sizeof(last_dispatched_job_v1) - 1);
             }
-
             work_fingerprint_t fp;
             fp_from_v1(&fp, j);
             work_changed = !fp_equal(&g_last_fp_v1, &fp);
             g_last_fp_v1 = fp;
         }
 
-        /* --- Zorluk güncellemesi --- */
         if (GLOBAL_STATE->new_set_mining_difficulty_msg) {
             ESP_LOGI(TAG, "New pool difficulty %.2f", GLOBAL_STATE->pool_difficulty);
             difficulty = GLOBAL_STATE->pool_difficulty;
             GLOBAL_STATE->new_set_mining_difficulty_msg = false;
         }
 
-        /* --- Version mask güncellemesi --- */
         if (GLOBAL_STATE->new_stratum_version_rolling_msg && GLOBAL_STATE->ASIC_initalized) {
             ESP_LOGI(TAG, "Set chip version rolls 0x%08lx (bits:%d)",
                      (unsigned long)GLOBAL_STATE->version_mask,
@@ -353,21 +297,10 @@ void create_jobs_task(void *pvParameters)
             GLOBAL_STATE->new_stratum_version_rolling_msg = false;
         }
 
-        /* ============================================================
-         *  ROLLING MAKSİMİZASYON KARARI
-         *
-         *  Strateji:
-         *   1. clean_jobs=true           → MUTLAKA gönder (yeni blok)
-         *   2. Yeni job_id + work changed → gönder (gerçek yeni iş)
-         *   3. Yeni job_id ama work aynı  → MIN_JOB_LIFETIME dolmadıysa ATLA
-         *   4. Aynı job_id + clean=false  → ATLA (rolling devam etsin)
-         * ============================================================ */
-
         int64_t now_us = esp_timer_get_time();
         int64_t since_last_ms = (now_us - last_dispatch_us) / 1000;
 
         bool should_dispatch;
-
         if (clean) {
             should_dispatch = true;
         } else if (work_changed && is_new_job_id) {
@@ -379,16 +312,14 @@ void create_jobs_task(void *pvParameters)
                 should_dispatch = false;
             }
         } else if (is_new_job_id && !work_changed) {
-            ESP_LOGD(TAG, "Job %s cosmetic change (same fingerprint) — skipping", job_id);
+            ESP_LOGD(TAG, "Job %s cosmetic change — skipping", job_id);
             should_dispatch = false;
         } else {
             should_dispatch = false;
         }
 
-        // MAX_JOB_LIFETIME aşıldıysa zorla gönder (timeout/refresh için)
         if (!should_dispatch && since_last_ms >= MAX_JOB_LIFETIME_MS) {
-            ESP_LOGI(TAG, "Job %s max lifetime reached (%lld ms) — force dispatch",
-                     job_id, (long long)since_last_ms);
+            ESP_LOGI(TAG, "Job %s max lifetime reached — force dispatch", job_id);
             should_dispatch = true;
         }
 
@@ -399,7 +330,6 @@ void create_jobs_task(void *pvParameters)
             continue;
         }
 
-        /* --- Son protokol kontrolü --- */
         active_protocol = GLOBAL_STATE->stratum_protocol;
         if (active_protocol != current_work_protocol) {
             free_work_item(GLOBAL_STATE, current_work, current_work_protocol);
@@ -409,16 +339,14 @@ void create_jobs_task(void *pvParameters)
             continue;
         }
 
-        /* --- ASIC'e gönder --- */
         update_rolling_stats(job_id, job_version);
         last_dispatch_us = now_us;
 
         if (active_protocol == STRATUM_PROTOCOL_V2) {
-            if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
+            if (stratum_v2_is_extended_channel(GLOBAL_STATE))
                 generate_work_sv2_ext(GLOBAL_STATE, (sv2_ext_job_t *)current_work, difficulty);
-            } else {
+            else
                 generate_work_sv2(GLOBAL_STATE, (sv2_job_t *)current_work, difficulty);
-            }
         } else {
             generate_work(GLOBAL_STATE, (mining_notify *)current_work, difficulty);
         }
@@ -427,15 +355,10 @@ void create_jobs_task(void *pvParameters)
     }
 }
 
-/* ============================================================
- *  V1 İŞ ÜRETİMİ (artık rolling destekli)
- * ============================================================ */
-
 static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, double difficulty)
 {
     if (GLOBAL_STATE->extranonce_2_len > MAX_EXTRANONCE2_LEN) {
-        ESP_LOGE(TAG, "extranonce_2_len %d exceeds max %d",
-                 GLOBAL_STATE->extranonce_2_len, MAX_EXTRANONCE2_LEN);
+        ESP_LOGE(TAG, "extranonce_2_len too big");
         return;
     }
 
@@ -451,17 +374,12 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
     uint8_t merkle_root[32];
     calculate_merkle_root_hash(coinbase_tx_hash,
                                (uint8_t (*)[32])notification->merkle_branches,
-                               notification->n_merkle_branches,
-                               merkle_root);
+                               notification->n_merkle_branches, merkle_root);
 
     bm_job *next_job = malloc(sizeof(bm_job));
-    if (!next_job) {
-        ESP_LOGE(TAG, "malloc bm_job failed");
-        return;
-    }
+    if (!next_job) { ESP_LOGE(TAG, "malloc failed"); return; }
     memset(next_job, 0, sizeof(bm_job));
 
-    /* bm_job alanlarını doldur */
     next_job->version        = notification->version;
     next_job->target         = notification->target;
     next_job->ntime          = notification->ntime;
@@ -471,7 +389,6 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
     reverse_32bit_words(merkle_root, next_job->merkle_root);
     reverse_32bit_words(notification->prev_block_hash, next_job->prev_block_hash);
 
-    /* Version rolling midstate üretimi */
     uint8_t merkle_for_midstate[32];
     memcpy(merkle_for_midstate, merkle_root, 32);
     build_midstates(next_job,
@@ -485,7 +402,7 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
     next_job->version_mask = GLOBAL_STATE->version_mask;
 
     if (!GLOBAL_STATE->ASIC_initalized) {
-        ESP_LOGW(TAG, "ASIC not initialized, skipping V1 job send");
+        ESP_LOGW(TAG, "ASIC not initialized");
         free(next_job->jobid);
         free(next_job->extranonce2);
         free(next_job);
@@ -499,17 +416,10 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
     ASIC_send_work(GLOBAL_STATE, next_job);
 }
 
-/* ============================================================
- *  SV2 STANDART İŞ
- * ============================================================ */
-
 static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *sv2_job, double difficulty)
 {
     bm_job *next_job = malloc(sizeof(bm_job));
-    if (!next_job) {
-        ESP_LOGE(TAG, "malloc bm_job failed");
-        return;
-    }
+    if (!next_job) { ESP_LOGE(TAG, "malloc failed"); return; }
     memset(next_job, 0, sizeof(bm_job));
 
     uint32_t version_mask = GLOBAL_STATE->version_mask;
@@ -523,11 +433,8 @@ static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *sv2_job, dou
     reverse_32bit_words(sv2_job->merkle_root, next_job->merkle_root);
     reverse_32bit_words(sv2_job->prev_hash, next_job->prev_block_hash);
 
-    build_midstates(next_job,
-                    sv2_job->version,
-                    sv2_job->prev_hash,
-                    sv2_job->merkle_root,
-                    version_mask);
+    build_midstates(next_job, sv2_job->version, sv2_job->prev_hash,
+                    sv2_job->merkle_root, version_mask);
 
     char jobid_str[16];
     snprintf(jobid_str, sizeof(jobid_str), "%" PRIu32, sv2_job->job_id);
@@ -536,7 +443,7 @@ static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *sv2_job, dou
     next_job->version_mask = version_mask;
 
     if (!GLOBAL_STATE->ASIC_initalized) {
-        ESP_LOGW(TAG, "ASIC not initialized, skipping SV2 job");
+        ESP_LOGW(TAG, "ASIC not initialized");
         free(next_job->jobid);
         free(next_job->extranonce2);
         free(next_job);
@@ -549,20 +456,13 @@ static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *sv2_job, dou
     ASIC_send_work(GLOBAL_STATE, next_job);
 }
 
-/* ============================================================
- *  SV2 GENİŞLETİLMİŞ İŞ (extended channel)
- * ============================================================ */
-
 static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *ext_job, double difficulty)
 {
     sv2_conn_t *conn = GLOBAL_STATE->sv2_conn;
     if (!conn) return;
 
     bm_job *next_job = malloc(sizeof(bm_job));
-    if (!next_job) {
-        ESP_LOGE(TAG, "malloc bm_job failed");
-        return;
-    }
+    if (!next_job) { ESP_LOGE(TAG, "malloc failed"); return; }
     memset(next_job, 0, sizeof(bm_job));
 
     uint32_t version_mask = GLOBAL_STATE->version_mask;
@@ -582,8 +482,7 @@ static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *ext_
     uint8_t merkle_root[32];
     calculate_merkle_root_hash(coinbase_tx_hash,
                                (const uint8_t (*)[32])ext_job->merkle_path,
-                               ext_job->merkle_path_count,
-                               merkle_root);
+                               ext_job->merkle_path_count, merkle_root);
 
     next_job->version        = ext_job->version;
     next_job->target         = ext_job->nbits;
@@ -594,11 +493,8 @@ static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *ext_
     reverse_32bit_words(merkle_root, next_job->merkle_root);
     reverse_32bit_words(ext_job->prev_hash, next_job->prev_block_hash);
 
-    build_midstates(next_job,
-                    ext_job->version,
-                    ext_job->prev_hash,
-                    merkle_root,
-                    version_mask);
+    build_midstates(next_job, ext_job->version, ext_job->prev_hash,
+                    merkle_root, version_mask);
 
     char jobid_str[16];
     snprintf(jobid_str, sizeof(jobid_str), "%" PRIu32, ext_job->job_id);
@@ -610,7 +506,7 @@ static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *ext_
     next_job->version_mask = version_mask;
 
     if (!GLOBAL_STATE->ASIC_initalized) {
-        ESP_LOGW(TAG, "ASIC not initialized, skipping SV2 ext job");
+        ESP_LOGW(TAG, "ASIC not initialized");
         free(next_job->jobid);
         free(next_job->extranonce2);
         free(next_job);
