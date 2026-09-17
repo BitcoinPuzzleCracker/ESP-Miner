@@ -36,7 +36,6 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
     uint8_t merkle_root[32];
     char extranonce_2_str[MAX_EXTRANONCE2_STR] = "";
 
-    // BIP320: software version rolling of hardware version rolling
     uint32_t effective_version = job->version;
     if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
         effective_version = current_version;
@@ -52,7 +51,6 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
             return;
         }
 
-        // Extranonce2 vast op 0 voor maximale ASIC performance (Antpool / Foundry standaard)
         (void)extranonce_2;
         uint8_t extranonce_2_bin[MAX_EXTRANONCE2_LEN] = {0};
         if (e2_len > 0) {
@@ -105,7 +103,6 @@ void create_jobs_task(void *pvParameters)
     uint32_t current_version = 0;
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
-    // Geheugen voor de slimme Job ID check (uit netalsantpool logica)
     static char last_dispatched_job_id[64] = {0};
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
@@ -121,9 +118,8 @@ void create_jobs_task(void *pvParameters)
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
             
-            // Slimme Job ID check: Is dit echt een nieuwe taak?
             bool is_new_job_id = false;
-            if (new_work && new_work->job_id) {
+            if (new_work) {
                 if (strcmp(last_dispatched_job_id, new_work->job_id) != 0) {
                     is_new_job_id = true;
                     strncpy(last_dispatched_job_id, new_work->job_id, sizeof(last_dispatched_job_id) - 1);
@@ -146,7 +142,6 @@ void create_jobs_task(void *pvParameters)
 
             extranonce_2 = 0;
 
-            // KRITIEK: Stuur door als clean_jobs true is OF als het een unieke nieuwe Job ID is!
             if (!new_work->clean_jobs && !is_new_job_id) {
                 continue;
             }
