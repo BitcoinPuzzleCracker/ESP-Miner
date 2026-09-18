@@ -71,8 +71,8 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
 
     construct_bm_job_from_miner_job(job, effective_version, merkle_root, version_mask, job_diff, GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates, next_job);
     
-    // Güvenli string kopyalama ve bellek sızıntısı koruması
-    next_job->jobid = job->job_id ? strdup(job->job_id) : NULL;
+    // job_id sabit boyutlu dizi olduğundan doğrudan kopyalanır
+    next_job->jobid = strdup(job->job_id);
     next_job->extranonce2 = strdup(extranonce_2_str);
 
     if (next_job->jobid == NULL || next_job->extranonce2 == NULL) {
@@ -114,7 +114,6 @@ void create_jobs_task(void *pvParameters)
         uint64_t start_time = esp_timer_get_time();
         uint32_t slot_notify = 0;
         
-        // Timeout değerinin negatif olmasını önleyen güvenlik sınırı
         if (timeout_ms < 0) {
             timeout_ms = 0;
         }
@@ -129,7 +128,7 @@ void create_jobs_task(void *pvParameters)
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
             
             bool is_new_job_id = false;
-            if (new_work && new_work->job_id) {
+            if (new_work) {
                 if (strcmp(last_dispatched_job_id, new_work->job_id) != 0) {
                     is_new_job_id = true;
                     strncpy(last_dispatched_job_id, new_work->job_id, sizeof(last_dispatched_job_id) - 1);
@@ -139,7 +138,7 @@ void create_jobs_task(void *pvParameters)
 
             if (new_work) {
                 ESP_LOGI(TAG, "New Work Activated (slot %lu) %s (type %d, new_id: %s)", 
-                         (unsigned long)slot_notify, new_work->job_id ? new_work->job_id : "NULL", new_work->type, is_new_job_id ? "true" : "false");
+                         (unsigned long)slot_notify, new_work->job_id, new_work->type, is_new_job_id ? "true" : "false");
                 
                 current_work = new_work;
                 GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
@@ -147,7 +146,7 @@ void create_jobs_task(void *pvParameters)
                 current_version = new_work->version;
 
                 if (new_work->version_mask != current_version_mask && GLOBAL_STATE->ASIC_initalized) {
-                    ESP_LOGI(Tag, "Set chip version rolls %i", (int)(new_work->version_mask >> 13));
+                    ESP_LOGI(TAG, "Set chip version rolls %i", (int)(new_work->version_mask >> 13));
                     ASIC_set_version_mask(GLOBAL_STATE, new_work->version_mask);
                     current_version_mask = new_work->version_mask;
                 }
