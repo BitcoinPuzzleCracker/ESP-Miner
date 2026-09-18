@@ -70,7 +70,9 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
     }
 
     construct_bm_job_from_miner_job(job, effective_version, merkle_root, version_mask, job_diff, GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates, next_job);
-    next_job->jobid = strdup(job->job_id);
+    
+    // Güvenli string kopyalama ve bellek sızıntısı koruması
+    next_job->jobid = job->job_id ? strdup(job->job_id) : NULL;
     next_job->extranonce2 = strdup(extranonce_2_str);
 
     if (next_job->jobid == NULL || next_job->extranonce2 == NULL) {
@@ -111,43 +113,56 @@ void create_jobs_task(void *pvParameters)
     while (1) {
         uint64_t start_time = esp_timer_get_time();
         uint32_t slot_notify = 0;
+        
+        // Timeout değerinin negatif olmasını önleyen güvenlik sınırı
+        if (timeout_ms < 0) {
+            timeout_ms = 0;
+        }
+        
         TickType_t wait_ticks = (timeout_ms > 0) ? pdMS_TO_TICKS(timeout_ms) : 0;
         BaseType_t notified = xTaskNotifyWait(0, ULONG_MAX, &slot_notify, wait_ticks);
-        timeout_ms -= (esp_timer_get_time() - start_time) / 1000;
+        
+        int64_t elapsed_ms = (esp_timer_get_time() - start_time) / 1000;
+        timeout_ms -= (int)elapsed_ms;
 
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
             
             bool is_new_job_id = false;
-            if (new_work) {
+            if (new_work && new_work->job_id) {
                 if (strcmp(last_dispatched_job_id, new_work->job_id) != 0) {
                     is_new_job_id = true;
                     strncpy(last_dispatched_job_id, new_work->job_id, sizeof(last_dispatched_job_id) - 1);
+                    last_dispatched_job_id[sizeof(last_dispatched_job_id) - 1] = '\0';
                 }
             }
 
-            ESP_LOGI(TAG, "New Work Activated (slot %lu) %s (type %d, new_id: %s)", 
-                     (unsigned long)slot_notify, new_work->job_id, new_work->type, is_new_job_id ? "true" : "false");
-            
-            current_work = new_work;
-            GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
-            current_work_sent = false;
-            current_version = new_work->version;
+            if (new_work) {
+                ESP_LOGI(TAG, "New Work Activated (slot %lu) %s (type %d, new_id: %s)", 
+                         (unsigned long)slot_notify, new_work->job_id ? new_work->job_id : "NULL", new_work->type, is_new_job_id ? "true" : "false");
+                
+                current_work = new_work;
+                GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
+                current_work_sent = false;
+                current_version = new_work->version;
 
-            if (new_work->version_mask != current_version_mask && GLOBAL_STATE->ASIC_initalized) {
-                ESP_LOGI(TAG, "Set chip version rolls %i", (int)(new_work->version_mask >> 13));
-                ASIC_set_version_mask(GLOBAL_STATE, new_work->version_mask);
-                current_version_mask = new_work->version_mask;
-            }
+                if (new_work->version_mask != current_version_mask && GLOBAL_STATE->ASIC_initalized) {
+                    ESP_LOGI(Tag, "Set chip version rolls %i", (int)(new_work->version_mask >> 13));
+                    ASIC_set_version_mask(GLOBAL_STATE, new_work->version_mask);
+                    current_version_mask = new_work->version_mask;
+                }
 
-            extranonce_2 = 0;
+                extranonce_2 = 0;
 
-            if (!new_work->clean_jobs && !is_new_job_id) {
-                continue;
+                if (!new_work->clean_jobs && !is_new_job_id) {
+                    timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
+                    continue;
+                }
             }
         } else {
             if (current_work == NULL) {
-                vTaskDelay(100 / portTICK_PERIOD_MS);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
                 continue;
             }
 
@@ -157,17 +172,19 @@ void create_jobs_task(void *pvParameters)
             }
         }
 
-        generate_work_from_miner_job(GLOBAL_STATE, current_work, extranonce_2, current_version);
-        if (!current_work_sent) {
-            SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
-        }
-        current_work_sent = true;
+        if (current_work != NULL) {
+            generate_work_from_miner_job(GLOBAL_STATE, current_work, extranonce_2, current_version);
+            if (!current_work_sent) {
+                SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
+            }
+            current_work_sent = true;
 
-        if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
-            uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
-            uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
-            for (int i = 0; i < midstates; i++) {
-                current_version = increment_bitmask(current_version, mask);
+            if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
+                uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
+                uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
+                for (int i = 0; i < midstates; i++) {
+                    current_version = increment_bitmask(current_version, mask);
+                }
             }
         }
 
