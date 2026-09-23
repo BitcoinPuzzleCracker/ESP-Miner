@@ -20,6 +20,12 @@ static const char *TAG = "create_jobs_task";
 #define MAX_EXTRANONCE2_LEN 32
 #define MAX_EXTRANONCE2_STR (MAX_EXTRANONCE2_LEN * 2 + 1)
 
+// Debounce: negeer duplicate-meldingen gedurende 2 seconden na een roll
+#define EXTRANONCE_ROLL_DEBOUNCE_US (2ULL * 1000 * 1000)
+
+// Globaal: wordt gezet door stratum_v1.c als een "Duplicate" binnenkomt
+volatile bool g_extranonce2_roll_requested = false;
+
 static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_job_t *job, uint64_t extranonce_2, uint32_t current_version)
 {
     if (!job) return;
@@ -97,14 +103,13 @@ void create_jobs_task(void *pvParameters)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
 
-    // active_jobs / valid_jobs are allocated and zeroed by SYSTEM_init_system(),
-    // before any task that touches them can run.
-
     uint32_t current_version_mask = 0;
     miner_job_t *current_work = NULL;
     bool current_work_sent = false;
+    bool coinbase_needs_decode = true;      // alleen bij nieuwe pool-job
     uint64_t extranonce_2 = 0;
     uint32_t current_version = 0;
+    uint64_t last_roll_us = 0;               // debounce-timestamp
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
@@ -120,11 +125,8 @@ void create_jobs_task(void *pvParameters)
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
 
-            // ---------------------------------------------------------------
-            // Alleen switchen bij een ECHTE nieuwe block-job (clean_jobs == true).
-            // clean_jobs == false = pool-refresh (nieuwe txns / fees),
-            // prevhash is hetzelfde -> wij blijven op de huidige job doorrollen.
-            // ---------------------------------------------------------------
+            // Refresh-notifies negeren we volledig. Ronde 2 en verder komen
+            // door duplicate-detectie, niet door refresh.
             if (!new_work->clean_jobs && current_work != NULL) {
                 ESP_LOGI(TAG, "Ignoring refresh notify (slot %lu, job %s), staying on %s",
                          (unsigned long)slot_notify, new_work->job_id, current_work->job_id);
@@ -138,6 +140,7 @@ void create_jobs_task(void *pvParameters)
             current_work = new_work;
             GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
             current_work_sent = false;
+            coinbase_needs_decode = true;
             current_version = new_work->version;
 
             if (new_work->version_mask != current_version_mask && GLOBAL_STATE->ASIC_initalized) {
@@ -146,39 +149,49 @@ void create_jobs_task(void *pvParameters)
                 current_version_mask = new_work->version_mask;
             }
 
+            // Reset ronde
             extranonce_2 = 0;
-
-            // Was: if (!current_work->clean_jobs) continue;
-            // Vervangen: we zijn hier al alleen bij clean_jobs == true,
-            // dus geen continue meer nodig.
+            last_roll_us = esp_timer_get_time();
+            g_extranonce2_roll_requested = false;
+            ESP_LOGI(TAG, "Extranonce2 reset -> 0");
         } else {
             if (current_work == NULL) {
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 continue;
             }
 
-            // ---------------------------------------------------------------
-            // Extranonce2 rolt niet meer -> dezelfde work opnieuw sturen
-            // heeft geen zin. Wacht op een nieuwe clean_jobs=true job.
-            // ---------------------------------------------------------------
+            // ----- Duplicate-detectie: ronde voorbij, rol extranonce2 -----
+            if (g_extranonce2_roll_requested) {
+                uint64_t now_us = esp_timer_get_time();
+                if (now_us - last_roll_us >= EXTRANONCE_ROLL_DEBOUNCE_US) {
+                    extranonce_2++;
+                    last_roll_us = now_us;
+                    current_work_sent = false;
+                    coinbase_needs_decode = false;   // coinbase blijft hetzelfde, alleen extranonce2 in hash verschilt
+                    ESP_LOGI(TAG, "Duplicate detected -> extranonce2 rolled to %" PRIu64, extranonce_2);
+                } else {
+                    ESP_LOGD(TAG, "Duplicate debounced (last roll %" PRIu64 " ms ago)",
+                             (now_us - last_roll_us) / 1000);
+                }
+                g_extranonce2_roll_requested = false;
+            }
+
+            // Werk verstuurd en niks aan de hand? Blijf wachten.
             if (current_work_sent
-                && GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
+                && GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling
+                && !g_extranonce2_roll_requested) {
                 timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
                 continue;
             }
         }
 
         generate_work_from_miner_job(GLOBAL_STATE, current_work, extranonce_2, current_version);
-        if (!current_work_sent) {
+        if (coinbase_needs_decode) {
             SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
+            coinbase_needs_decode = false;
         }
         current_work_sent = true;
 
-        // ---------------------------------------------------------------
-        // EXTRANONCE2 ROLLING UITGESCHAKELD
-        // extranonce_2 blijft altijd 0.
-        // Versie-rolling blijft ONGEWIJZIGD.
-        // ---------------------------------------------------------------
         if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
             uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
             uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
