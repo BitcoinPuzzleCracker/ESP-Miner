@@ -142,7 +142,14 @@ void create_jobs_task(void *pvParameters)
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 continue;
             }
-            if (!miner_job_is_rollable(current_work) && current_work_sent && GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
+
+            // ---------------------------------------------------------------
+            // Extranonce2 rolt niet meer -> dezelfde work opnieuw sturen
+            // heeft geen zin (zou dezelfde nonce opnieuw vinden).
+            // Wacht daarom gewoon op een nieuwe job van de pool.
+            // ---------------------------------------------------------------
+            if (current_work_sent
+                && GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
                 timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
                 continue;
             }
