@@ -119,7 +119,22 @@ void create_jobs_task(void *pvParameters)
 
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
-            ESP_LOGI(TAG, "New Work Activated (slot %lu) %s (type %d)", (unsigned long)slot_notify, new_work->job_id, new_work->type);
+
+            // ---------------------------------------------------------------
+            // Alleen switchen bij een ECHTE nieuwe block-job (clean_jobs == true).
+            // clean_jobs == false = pool-refresh (nieuwe txns / fees),
+            // prevhash is hetzelfde -> wij blijven op de huidige job doorrollen.
+            // ---------------------------------------------------------------
+            if (!new_work->clean_jobs && current_work != NULL) {
+                ESP_LOGI(TAG, "Ignoring refresh notify (slot %lu, job %s), staying on %s",
+                         (unsigned long)slot_notify, new_work->job_id, current_work->job_id);
+                timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
+                continue;
+            }
+
+            ESP_LOGI(TAG, "New Work Activated (slot %lu) %s (type %d) clean_jobs=%d",
+                     (unsigned long)slot_notify, new_work->job_id, new_work->type,
+                     (int)new_work->clean_jobs);
             current_work = new_work;
             GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
             current_work_sent = false;
@@ -133,10 +148,9 @@ void create_jobs_task(void *pvParameters)
 
             extranonce_2 = 0;
 
-            if (!current_work->clean_jobs) {
-                // Staged job for next cycle, let current ASIC cycle finish
-                continue;
-            }
+            // Was: if (!current_work->clean_jobs) continue;
+            // Vervangen: we zijn hier al alleen bij clean_jobs == true,
+            // dus geen continue meer nodig.
         } else {
             if (current_work == NULL) {
                 vTaskDelay(100 / portTICK_PERIOD_MS);
@@ -145,8 +159,7 @@ void create_jobs_task(void *pvParameters)
 
             // ---------------------------------------------------------------
             // Extranonce2 rolt niet meer -> dezelfde work opnieuw sturen
-            // heeft geen zin (zou dezelfde nonce opnieuw vinden).
-            // Wacht daarom gewoon op een nieuwe job van de pool.
+            // heeft geen zin. Wacht op een nieuwe clean_jobs=true job.
             // ---------------------------------------------------------------
             if (current_work_sent
                 && GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
@@ -163,12 +176,10 @@ void create_jobs_task(void *pvParameters)
 
         // ---------------------------------------------------------------
         // EXTRANONCE2 ROLLING UITGESCHAKELD
-        // extranonce_2 blijft altijd 0. De coinbase wordt dus altijd
-        // gevuld met nullen (4 of 8 bytes, afhankelijk van extranonce2_len).
+        // extranonce_2 blijft altijd 0.
         // Versie-rolling blijft ONGEWIJZIGD.
         // ---------------------------------------------------------------
         if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
-            // Software version rolling voor ASICs zonder hardware version rolling (bijv. BM1397)
             uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
             uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
             for (int i = 0; i < midstates; i++) {
