@@ -209,9 +209,9 @@ void create_jobs_task(void *pvParameters)
             }
         }
 
-        // NIEUW: bij hardware version rolling ook de software-base ophogen,
-        // anders blijft de ASIC in hetzelfde kleine bereik hangen en zie je
-        // steeds dezelfde versie-waarden terugkomen.
+        // Bij hardware version rolling ook de software-base ophogen.
+        // Zonder dit blijft de ASIC in hetzelfde kleine bereik hangen
+        // (bijv. 20000000..2015C000) en zie je steeds dezelfde waarden terug.
         if (GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling
             && !force_version_rolling) {
             current_version = increment_bitmask(current_version, mask);
