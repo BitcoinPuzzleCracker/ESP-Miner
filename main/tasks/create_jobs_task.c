@@ -107,9 +107,9 @@ void create_jobs_task(void *pvParameters)
     uint32_t current_version = 0;
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
-    // Voor overflow-detectie van extranonce_2 (op basis van extranonce2_len van de huidige job)
-    uint64_t extranonce_2_limit = 0;      // 0 = geen limiet bekend
-    bool force_version_rolling = false;   // zodra extranonce_2 wrapt, schakelen we over
+    // Voor overflow-detectie van extranonce_2
+    uint64_t extranonce_2_limit = 0;
+    bool force_version_rolling = false;
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
     ESP_LOGI(TAG, "ASIC Ready!");
@@ -124,8 +124,9 @@ void create_jobs_task(void *pvParameters)
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
 
+            // ALLEEN wisselen bij een ECHTE nieuwe job (clean_jobs = true).
+            // Template refreshes (clean_jobs = false) negeren we en blijven doorrollen.
             if (new_work->clean_jobs) {
-                // ECHT nieuw blok -> wisselen
                 ESP_LOGI(TAG, "New Work Activated (slot %lu) %s (type %d)",
                          (unsigned long)slot_notify, new_work->job_id, new_work->type);
 
@@ -137,10 +138,10 @@ void create_jobs_task(void *pvParameters)
                 extranonce_2 = 0;
                 force_version_rolling = false;
 
-                // Bereken de extranonce_2 limiet voor overflow-detectie
+                // extranonce_2 limiet voor overflow-detectie
                 if (miner_job_is_rollable(new_work) && new_work->extranonce2_len > 0) {
                     if (new_work->extranonce2_len >= 8) {
-                        extranonce_2_limit = 0;   // 8 bytes => geen praktische limiet
+                        extranonce_2_limit = 0;   // geen praktische limiet
                     } else {
                         extranonce_2_limit = (uint64_t)1 << (new_work->extranonce2_len * 8);
                     }
@@ -156,7 +157,7 @@ void create_jobs_task(void *pvParameters)
                     current_version_mask = new_work->version_mask;
                 }
             } else {
-                // Staged job (clean_jobs = false) -> negeren, blijf doorrollen op huidige werk
+                // Staged job (clean_jobs = false) -> negeren, blijf doorrollen
                 ESP_LOGI(TAG, "Staged job (slot %lu) %s genegeerd, blijf op huidige work",
                          (unsigned long)slot_notify, new_work->job_id);
             }
@@ -165,11 +166,9 @@ void create_jobs_task(void *pvParameters)
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 continue;
             }
-            // Geen skip: blijf met current_work doorrollen
-            // tot een ECHTE nieuwe job (clean_jobs=true) binnenkomt.
+            // Geen skip: blijf met current_work doorrollen tot een ECHTE nieuwe job komt.
         }
 
-        // Nog geen current_work (bv. alleen staged jobs gezien) -> niets doen
         if (current_work == NULL) {
             timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
             continue;
@@ -181,35 +180,42 @@ void create_jobs_task(void *pvParameters)
         }
         current_work_sent = true;
 
+        // ---- ROLLEN ----
+        uint32_t mask = (current_work->version_mask != 0)
+                        ? current_work->version_mask
+                        : BIP320_VERSION_ROLLING_MASK;
+
         if (miner_job_is_rollable(current_work) && !force_version_rolling) {
+            // Extranonce_2 rollen
             extranonce_2++;
 
-            // Overflow-guard: als extranonce_2 zijn limiet bereikt,
-            // schakel over op version-rolling (alleen als software rolling mogelijk is)
+            // Overflow-guard
             if (extranonce_2_limit != 0 && extranonce_2 >= extranonce_2_limit) {
                 if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
                     ESP_LOGW(TAG, "extranonce_2 overflow (len=%u), overschakelen op version-rolling",
                              (unsigned)current_work->extranonce2_len);
                     force_version_rolling = true;
                 } else {
-                    // Hardware version rolling doet de ASIC zelf; reset extranonce om door te gaan
                     ESP_LOGW(TAG, "extranonce_2 overflow (len=%u), reset naar 0",
                              (unsigned)current_work->extranonce2_len);
                     extranonce_2 = 0;
                 }
             }
         } else if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
-            // Software version rolling voor ASICs zonder hardware version rolling
-            // (bv. BM1397) op SV2 Standard Channel, of na extranonce overflow.
-            uint32_t mask = (current_work->version_mask != 0)
-                            ? current_work->version_mask
-                            : BIP320_VERSION_ROLLING_MASK;
+            // Pure software version rolling (bv. BM1397)
             uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
             for (int i = 0; i < midstates; i++) {
                 current_version = increment_bitmask(current_version, mask);
             }
         }
-        // Anders: hardware version rolling -> ASIC rolt zelf verder, wij sturen gewoon dezelfde work opnieuw.
+
+        // NIEUW: bij hardware version rolling ook de software-base ophogen,
+        // anders blijft de ASIC in hetzelfde kleine bereik hangen en zie je
+        // steeds dezelfde versie-waarden terugkomen.
+        if (GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling
+            && !force_version_rolling) {
+            current_version = increment_bitmask(current_version, mask);
+        }
 
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
     }
