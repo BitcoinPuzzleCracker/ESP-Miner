@@ -90,9 +90,8 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE,
                                     GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates,
                                     next_job);
 
-    /* ---------------- NTime rolling override ---------------- */
+    /* NTime rolling override */
     next_job->ntime = job->ntime + (uint32_t)ntime_offset;
-    /* -------------------------------------------------------- */
 
     next_job->jobid       = strdup(job->job_id);
     next_job->extranonce2 = strdup(extranonce_2_str);
@@ -129,13 +128,11 @@ void create_jobs_task(void *pvParameters)
     uint64_t extranonce_2         = 0;
     uint32_t current_version      = 0;
 
-    /* Eigen kopie van de ntime die we NU minen.
-     * BELANGRIJK: niet current_work->ntime gebruiken, want de pool kan
-     * dezelfde slot hergebruiken en dan wijst current_work naar
-     * overschreven data. */
+    /* Onze eigen kopie van de ntime die we NU minen — pool-slot mag
+     * hergebruikt worden zonder dat wij dat merken. */
     uint32_t current_job_ntime    = 0;
 
-    /* ---- NTime rolling state ---- */
+    /* NTime rolling state */
     int32_t  ntime_offset        = 0;
     uint32_t version_rolls_done  = 0;
     uint32_t version_rolls_total = 1;
@@ -144,6 +141,7 @@ void create_jobs_task(void *pvParameters)
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
     ESP_LOGI(TAG, "ASIC Ready! (ntime rolling up to +%d s)", NTIME_MAX_ROLL_SECONDS);
+    ESP_LOGI(TAG, "Mode: keep rolling (version + ntime) until NEW BLOCK arrives");
 
     while (1) {
         uint64_t start_time   = esp_timer_get_time();
@@ -157,39 +155,27 @@ void create_jobs_task(void *pvParameters)
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
 
             /* ---------------------------------------------------------
-             * Alleen switchen bij een ECHTE nieuwe block-job
-             * (clean_jobs == true). Bij refresh (clean_jobs == false)
-             * kan de pool dezelfde slot hergebruiken -> vergelijk met
-             * ONZE opgeslagen ntime, niet met current_work->ntime.
+             * REFRESH (clean_jobs == false):
+             *   Pool stuurt nieuwe txns/fees en een nieuwe ntime, maar
+             *   het blok is hetzelfde. Wij NEGEREN deze volledig en
+             *   blijven doorrollen op ONZE huidige work.
+             *
+             *   Alleen een ECHT nieuw blok (clean_jobs == true) mag
+             *   ons resetten.
              * --------------------------------------------------------- */
             if (!new_work->clean_jobs && current_work != NULL) {
-
-                ESP_LOGI(TAG, "Refresh notify (slot %lu, job %s)",
+                ESP_LOGI(TAG, "Refresh ignored (slot %lu, job %s) — staying on our roll",
                          (unsigned long)slot_notify, new_work->job_id);
-
-                if (new_work->ntime > current_job_ntime) {
-                    /* Nieuwere ntime -> adopt + reset roll space */
-                    current_work       = new_work;
-                    current_job_ntime  = new_work->ntime;
-                    ntime_offset       = 0;
-                    version_rolls_done = 0;
-                    current_version    = new_work->version;
-                    current_work_sent  = false;
-
-                    ESP_LOGI(TAG, "  -> adopting new ntime %u, resetting roll space",
-                             (unsigned)new_work->ntime);
-                } else {
-                    ESP_LOGI(TAG, "  -> keeping current ntime %u",
-                             (unsigned)current_job_ntime);
-                }
-
                 timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
                 continue;
             }
 
-            ESP_LOGI(TAG, "New Work Activated (slot %lu) %s (type %d) clean_jobs=%d",
-                     (unsigned long)slot_notify, new_work->job_id,
-                     new_work->type, (int)new_work->clean_jobs);
+            /* ---------------------------------------------------------
+             * NIEUW BLOK (clean_jobs == true):
+             *   Volledige reset van alle rolling-state.
+             * --------------------------------------------------------- */
+            ESP_LOGI(TAG, "*** NEW BLOCK *** (slot %lu) %s (type %d)",
+                     (unsigned long)slot_notify, new_work->job_id, new_work->type);
 
             current_work      = new_work;
             current_job_ntime = new_work->ntime;
@@ -201,7 +187,7 @@ void create_jobs_task(void *pvParameters)
             current_version   = new_work->version;
             extranonce_2      = 0;
 
-            /* Reset ntime rolling */
+            /* Reset alle rolling-state */
             ntime_offset       = 0;
             version_rolls_done = 0;
 
@@ -227,6 +213,7 @@ void create_jobs_task(void *pvParameters)
                 current_version_mask = new_work->version_mask;
             }
         } else {
+            /* Timeout — geen notify, ga gewoon door met onze eigen roll */
             if (current_work == NULL) {
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 continue;
