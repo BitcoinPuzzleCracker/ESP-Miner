@@ -91,15 +91,11 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE,
                                     next_job);
 
     /* ---------------- NTime rolling override ---------------- */
-    if (ntime_offset != 0) {
-        next_job->ntime = job->ntime + (uint32_t)ntime_offset;
-    } else {
-        next_job->ntime = job->ntime;
-    }
+    next_job->ntime = job->ntime + (uint32_t)ntime_offset;
     /* -------------------------------------------------------- */
 
-    next_job->jobid        = strdup(job->job_id);
-    next_job->extranonce2  = strdup(extranonce_2_str);
+    next_job->jobid       = strdup(job->job_id);
+    next_job->extranonce2 = strdup(extranonce_2_str);
 
     if (next_job->jobid == NULL || next_job->extranonce2 == NULL) {
         ESP_LOGE(TAG, "Failed to allocate job metadata");
@@ -128,10 +124,16 @@ void create_jobs_task(void *pvParameters)
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
 
     uint32_t current_version_mask = 0;
-    miner_job_t *current_work      = NULL;
-    bool     current_work_sent     = false;
-    uint64_t extranonce_2          = 0;
-    uint32_t current_version       = 0;
+    miner_job_t *current_work     = NULL;
+    bool     current_work_sent    = false;
+    uint64_t extranonce_2         = 0;
+    uint32_t current_version      = 0;
+
+    /* Eigen kopie van de ntime die we NU minen.
+     * BELANGRIJK: niet current_work->ntime gebruiken, want de pool kan
+     * dezelfde slot hergebruiken en dan wijst current_work naar
+     * overschreven data. */
+    uint32_t current_job_ntime    = 0;
 
     /* ---- NTime rolling state ---- */
     int32_t  ntime_offset        = 0;
@@ -144,8 +146,8 @@ void create_jobs_task(void *pvParameters)
     ESP_LOGI(TAG, "ASIC Ready! (ntime rolling up to +%d s)", NTIME_MAX_ROLL_SECONDS);
 
     while (1) {
-        uint64_t start_time  = esp_timer_get_time();
-        uint32_t slot_notify = 0;
+        uint64_t start_time   = esp_timer_get_time();
+        uint32_t slot_notify  = 0;
         TickType_t wait_ticks = (timeout_ms > 0) ? pdMS_TO_TICKS(timeout_ms) : 0;
 
         BaseType_t notified = xTaskNotifyWait(0, ULONG_MAX, &slot_notify, wait_ticks);
@@ -154,22 +156,31 @@ void create_jobs_task(void *pvParameters)
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
 
-            /* Alleen switchen bij een ECHTE nieuwe block-job (clean_jobs == true). */
+            /* ---------------------------------------------------------
+             * Alleen switchen bij een ECHTE nieuwe block-job
+             * (clean_jobs == true). Bij refresh (clean_jobs == false)
+             * kan de pool dezelfde slot hergebruiken -> vergelijk met
+             * ONZE opgeslagen ntime, niet met current_work->ntime.
+             * --------------------------------------------------------- */
             if (!new_work->clean_jobs && current_work != NULL) {
-                ESP_LOGI(TAG, "Ignoring refresh notify (slot %lu, job %s), staying on %s",
-                         (unsigned long)slot_notify,
-                         new_work->job_id, current_work->job_id);
 
-                /* Refresh-job: pool stuurt soms nieuwe ntime.
-                 * We kunnen onze offset resetten om extra ruimte te krijgen. */
-                if (new_work->ntime > current_work->ntime) {
-                    current_work = new_work;   /* nieuwe ntime overnemen */
-                    ntime_offset        = 0;
-                    version_rolls_done  = 0;
-                    current_version     = new_work->version;
-                    current_work_sent   = false;
-                    ESP_LOGI(TAG, "Refresh with newer ntime %u, resetting roll space",
+                ESP_LOGI(TAG, "Refresh notify (slot %lu, job %s)",
+                         (unsigned long)slot_notify, new_work->job_id);
+
+                if (new_work->ntime > current_job_ntime) {
+                    /* Nieuwere ntime -> adopt + reset roll space */
+                    current_work       = new_work;
+                    current_job_ntime  = new_work->ntime;
+                    ntime_offset       = 0;
+                    version_rolls_done = 0;
+                    current_version    = new_work->version;
+                    current_work_sent  = false;
+
+                    ESP_LOGI(TAG, "  -> adopting new ntime %u, resetting roll space",
                              (unsigned)new_work->ntime);
+                } else {
+                    ESP_LOGI(TAG, "  -> keeping current ntime %u",
+                             (unsigned)current_job_ntime);
                 }
 
                 timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
@@ -180,7 +191,9 @@ void create_jobs_task(void *pvParameters)
                      (unsigned long)slot_notify, new_work->job_id,
                      new_work->type, (int)new_work->clean_jobs);
 
-            current_work = new_work;
+            current_work      = new_work;
+            current_job_ntime = new_work->ntime;
+
             GLOBAL_STATE->active_job_slot_idx =
                 (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
 
@@ -189,8 +202,8 @@ void create_jobs_task(void *pvParameters)
             extranonce_2      = 0;
 
             /* Reset ntime rolling */
-            ntime_offset        = 0;
-            version_rolls_done  = 0;
+            ntime_offset       = 0;
+            version_rolls_done = 0;
 
             /* Bereken version rolling ruimte */
             if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
