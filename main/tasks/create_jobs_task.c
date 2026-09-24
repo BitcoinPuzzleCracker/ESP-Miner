@@ -25,6 +25,11 @@ static const char *TAG = "create_jobs_task";
 /* ------------------------------------------------------------------ */
 #define NTIME_MAX_ROLL_SECONDS   7200   /* pool-limiet: +2 uur */
 
+/* Bij hardware version rolling kan de firmware niet weten wanneer de
+ * ASIC zijn version-ruimte heeft uitgeput. We bumpen daarom periodiek
+ * de ntime om verse hashes te forceren. */
+#define NTIME_BUMP_INTERVAL_S    300    /* 5 minuten */
+
 /* ------------------------------------------------------------------ */
 /* Job generatie                                                       */
 /* ------------------------------------------------------------------ */
@@ -90,7 +95,7 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE,
                                     GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates,
                                     next_job);
 
-    /* NTime rolling override */
+    /* NTime rolling override — ALTIJD toepassen, ongeacht HW/SW version rolling */
     next_job->ntime = job->ntime + (uint32_t)ntime_offset;
 
     next_job->jobid       = strdup(job->job_id);
@@ -128,8 +133,7 @@ void create_jobs_task(void *pvParameters)
     uint64_t extranonce_2         = 0;
     uint32_t current_version      = 0;
 
-    /* Onze eigen kopie van de ntime die we NU minen — pool-slot mag
-     * hergebruikt worden zonder dat wij dat merken. */
+    /* Onze eigen kopie van de ntime die we NU minen */
     uint32_t current_job_ntime    = 0;
 
     /* NTime rolling state */
@@ -137,11 +141,23 @@ void create_jobs_task(void *pvParameters)
     uint32_t version_rolls_done  = 0;
     uint32_t version_rolls_total = 1;
 
+    /* Time-based ntime bump (voor hardware version rolling) */
+    uint64_t last_ntime_bump_us  = 0;
+
+    const bool hw_version_rolling =
+        GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling;
+
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
     ESP_LOGI(TAG, "ASIC Ready! (ntime rolling up to +%d s)", NTIME_MAX_ROLL_SECONDS);
-    ESP_LOGI(TAG, "Mode: keep rolling (version + ntime) until NEW BLOCK arrives");
+    ESP_LOGI(TAG, "Mode: %s version rolling + software ntime rolling",
+             hw_version_rolling ? "hardware" : "software");
+
+    if (hw_version_rolling) {
+        ESP_LOGI(TAG, "NTime bump interval: %d s (hardware version rolling detected)",
+                 NTIME_BUMP_INTERVAL_S);
+    }
 
     while (1) {
         uint64_t start_time   = esp_timer_get_time();
@@ -155,24 +171,17 @@ void create_jobs_task(void *pvParameters)
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
 
             /* ---------------------------------------------------------
-             * REFRESH (clean_jobs == false):
-             *   Pool stuurt nieuwe txns/fees en een nieuwe ntime, maar
-             *   het blok is hetzelfde. Wij NEGEREN deze volledig en
-             *   blijven doorrollen op ONZE huidige work.
-             *
-             *   Alleen een ECHT nieuw blok (clean_jobs == true) mag
-             *   ons resetten.
+             * REFRESH: negeren, blijf op eigen roll
              * --------------------------------------------------------- */
             if (!new_work->clean_jobs && current_work != NULL) {
-                ESP_LOGI(TAG, "Refresh ignored (slot %lu, job %s) — staying on our roll",
+                ESP_LOGD(TAG, "Refresh ignored (slot %lu, job %s)",
                          (unsigned long)slot_notify, new_work->job_id);
                 timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
                 continue;
             }
 
             /* ---------------------------------------------------------
-             * NIEUW BLOK (clean_jobs == true):
-             *   Volledige reset van alle rolling-state.
+             * NIEUW BLOK: volledige reset
              * --------------------------------------------------------- */
             ESP_LOGI(TAG, "*** NEW BLOCK *** (slot %lu) %s (type %d)",
                      (unsigned long)slot_notify, new_work->job_id, new_work->type);
@@ -183,16 +192,17 @@ void create_jobs_task(void *pvParameters)
             GLOBAL_STATE->active_job_slot_idx =
                 (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
 
-            current_work_sent = false;
-            current_version   = new_work->version;
-            extranonce_2      = 0;
+            current_work_sent    = false;
+            current_version      = new_work->version;
+            extranonce_2         = 0;
 
-            /* Reset alle rolling-state */
-            ntime_offset       = 0;
-            version_rolls_done = 0;
+            /* Reset rolling state */
+            ntime_offset         = 0;
+            version_rolls_done   = 0;
+            last_ntime_bump_us   = esp_timer_get_time();
 
-            /* Bereken version rolling ruimte */
-            if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
+            /* Bereken version rolling ruimte (alleen relevant voor SW rolling) */
+            if (!hw_version_rolling) {
                 uint32_t mask = (new_work->version_mask != 0)
                                 ? new_work->version_mask
                                 : BIP320_VERSION_ROLLING_MASK;
@@ -213,26 +223,57 @@ void create_jobs_task(void *pvParameters)
                 current_version_mask = new_work->version_mask;
             }
         } else {
-            /* Timeout — geen notify, ga gewoon door met onze eigen roll */
+            /* Timeout */
             if (current_work == NULL) {
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 continue;
             }
 
-            /* Hardware rolling: 1x zenden is genoeg */
-            if (current_work_sent
-                && GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
-                timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
-                continue;
-            }
+            /* ---------------------------------------------------------
+             * HARDWARE VERSION ROLLING:
+             *   De ASIC rolt zelf de versie-bits. Wij kunnen niet weten
+             *   wanneer hij klaar is. Daarom bumpen we periodiek de ntime
+             *   om verse hashes te forceren en duplicates te voorkomen.
+             * --------------------------------------------------------- */
+            if (hw_version_rolling) {
+                if (!current_work_sent) {
+                    /* Nog niets verzonden — valt door naar send hieronder */
+                } else {
+                    uint64_t elapsed_s =
+                        (esp_timer_get_time() - last_ntime_bump_us) / 1000000ULL;
 
-            /* Volledige werkruimte op? -> wacht op nieuw blok */
-            if (current_work_sent
-                && !GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling
-                && version_rolls_done >= version_rolls_total
-                && ntime_offset > NTIME_MAX_ROLL_SECONDS) {
-                vTaskDelay(pdMS_TO_TICKS(100));
-                continue;
+                    if (elapsed_s >= NTIME_BUMP_INTERVAL_S) {
+                        if (ntime_offset < NTIME_MAX_ROLL_SECONDS) {
+                            ntime_offset++;
+                            current_work_sent  = false;
+                            last_ntime_bump_us = esp_timer_get_time();
+
+                            ESP_LOGI(TAG, "NTime bump (HW-rolling) -> offset %" PRId32
+                                          " (job %s)",
+                                     ntime_offset, current_work->job_id);
+                        } else {
+                            /* Uitgeput — wacht op nieuw blok */
+                            ESP_LOGW(TAG, "NTime range exhausted, waiting for new block");
+                            vTaskDelay(pdMS_TO_TICKS(100));
+                            continue;
+                        }
+                    } else {
+                        timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
+                        continue;
+                    }
+                }
+            } else {
+                /* -----------------------------------------------------
+                 * SOFTWARE VERSION ROLLING:
+                 *   Traditionele aanpak: version-ruimte uitputten,
+                 *   dan ntime+1, herhaal tot NTIME_MAX_ROLL_SECONDS.
+                 * ----------------------------------------------------- */
+                if (current_work_sent
+                    && version_rolls_done >= version_rolls_total
+                    && ntime_offset > NTIME_MAX_ROLL_SECONDS) {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    continue;
+                }
             }
         }
 
@@ -246,8 +287,8 @@ void create_jobs_task(void *pvParameters)
         }
         current_work_sent = true;
 
-        /* ---------------- Version + NTime rolling ---------------- */
-        if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
+        /* ---------------- Software version rolling ---------------- */
+        if (!hw_version_rolling) {
             uint32_t mask = (current_work->version_mask != 0)
                             ? current_work->version_mask
                             : BIP320_VERSION_ROLLING_MASK;
