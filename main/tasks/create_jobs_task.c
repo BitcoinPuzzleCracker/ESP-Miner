@@ -97,13 +97,10 @@ void create_jobs_task(void *pvParameters)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
 
-    // active_jobs / valid_jobs are allocated and zeroed by SYSTEM_init_system(),
-    // before any task that touches them can run.
-
     uint32_t current_version_mask = 0;
     miner_job_t *current_work = NULL;
     bool current_work_sent = false;
-    uint64_t extranonce_2 = 0;
+    uint64_t extranonce_2 = 0; // Vast op 0, wordt niet meer opgehoogd
     uint32_t current_version = 0;
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
@@ -119,6 +116,8 @@ void create_jobs_task(void *pvParameters)
 
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
+            if (new_work == NULL) continue;
+
             ESP_LOGI(TAG, "New Work Activated (slot %lu) %s (type %d)", (unsigned long)slot_notify, new_work->job_id, new_work->type);
             current_work = new_work;
             GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
@@ -133,8 +132,14 @@ void create_jobs_task(void *pvParameters)
 
             extranonce_2 = 0;
 
-            if (!new_work->clean_jobs) {
-                // Staged job for next cycle, let current ASIC cycle finish
+            // Als clean_jobs true is, direct naar de ASIC sturen om oude jobs te vermijden
+            if (new_work->clean_jobs) {
+                generate_work_from_miner_job(GLOBAL_STATE, current_work, extranonce_2, current_version);
+                SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
+                current_work_sent = true;
+                timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
+                continue;
+            } else {
                 continue;
             }
         } else {
@@ -148,19 +153,15 @@ void create_jobs_task(void *pvParameters)
             }
         }
 
+        if (GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling && current_work_sent) {
+            timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
+            continue;
+        }
+
         generate_work_from_miner_job(GLOBAL_STATE, current_work, extranonce_2, current_version);
         if (!current_work_sent) {
             SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
-        }
-        current_work_sent = true;
-
-        // Extranonce2 roll logica is hier verwijderd; optionele software fallback voor niet-hardware rolling blijft behouden
-        if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling && !miner_job_is_rollable(current_work)) {
-            uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
-            uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
-            for (int i = 0; i < midstates; i++) {
-                current_version = increment_bitmask(current_version, mask);
-            }
+            current_work_sent = true;
         }
         
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
