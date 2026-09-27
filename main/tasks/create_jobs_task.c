@@ -100,7 +100,7 @@ void create_jobs_task(void *pvParameters)
     uint32_t current_version_mask = 0;
     miner_job_t *current_work = NULL;
     bool current_work_sent = false;
-    uint64_t extranonce_2 = 0; // Vast op 0, wordt niet meer opgehoogd
+    uint64_t extranonce_2 = 0; // Sabit kalır, asla artırılmaz
     uint32_t current_version = 0;
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
@@ -132,7 +132,7 @@ void create_jobs_task(void *pvParameters)
 
             extranonce_2 = 0;
 
-            // Als clean_jobs true is, direct naar de ASIC sturen om oude jobs te vermijden
+            // Havuz yeni ve temiz bir iş gönderdiğinde gecikmeden hemen işleme al
             if (new_work->clean_jobs) {
                 generate_work_from_miner_job(GLOBAL_STATE, current_work, extranonce_2, current_version);
                 SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
