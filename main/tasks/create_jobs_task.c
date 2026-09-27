@@ -100,7 +100,7 @@ void create_jobs_task(void *pvParameters)
     uint32_t current_version_mask = 0;
     miner_job_t *current_work = NULL;
     bool current_work_sent = false;
-    uint64_t extranonce_2 = 0; // Sabit kalır, asla artırılmaz
+    uint64_t extranonce_2 = 0; // Sabit kalır, artırılmaz
     uint32_t current_version = 0;
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
@@ -132,16 +132,12 @@ void create_jobs_task(void *pvParameters)
 
             extranonce_2 = 0;
 
-            // Havuz yeni ve temiz bir iş gönderdiğinde gecikmeden hemen işleme al
-            if (new_work->clean_jobs) {
-                generate_work_from_miner_job(GLOBAL_STATE, current_work, extranonce_2, current_version);
-                SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
-                current_work_sent = true;
-                timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
-                continue;
-            } else {
-                continue;
-            }
+            // Yeni iş geldiği anda eski işi bekletmeden hemen ASIC'e gönder
+            generate_work_from_miner_job(GLOBAL_STATE, current_work, extranonce_2, current_version);
+            SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
+            current_work_sent = true;
+            timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
+            continue;
         } else {
             if (current_work == NULL) {
                 vTaskDelay(100 / portTICK_PERIOD_MS);
