@@ -20,7 +20,7 @@ static const char *TAG = "create_jobs_task";
 #define MAX_EXTRANONCE2_LEN 32
 #define MAX_EXTRANONCE2_STR (MAX_EXTRANONCE2_LEN * 2 + 1)
 
-#define TARGET_JOB_LIFETIME_MS 10000 // Havuzun ortalama yeni iş gönderme süresi (10 saniye)
+#define TARGET_JOB_LIFETIME_MS 10000 // Hedeflenen 10 saniyelik pencere
 
 static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE,
                                          const miner_job_t *job,
@@ -40,7 +40,6 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE,
     uint8_t merkle_root[32];
     char    extranonce_2_str[MAX_EXTRANONCE2_STR] = "00000000"; // Extranonce2 sabit 0
 
-    // Versiyonu doğrudan yazılım tarafından üretilen effective_version ile güncelliyoruz
     uint32_t effective_version = current_version;
 
     if (job->type == JOB_TYPE_SV2_STANDARD) {
@@ -65,7 +64,7 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE,
                                     GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates,
                                     next_job);
 
-    next_job->ntime       = job->ntime; // Ntime sabit kalıyor, aralığı versiyonla tarıyoruz
+    next_job->ntime       = job->ntime;
     next_job->jobid       = strdup(job->job_id);
     next_job->extranonce2 = strdup(extranonce_2_str);
 
@@ -97,14 +96,13 @@ void create_jobs_task(void *pvParameters)
     bool     current_work_sent    = false;
     uint32_t current_version      = 0;
 
-    // Versiyon aralığı ve adım takibi için değişkenler
     uint32_t version_rolls_done   = 0;
     uint32_t version_rolls_total  = 1;
-    uint32_t steps_per_interval   = 1; // 10 saniyeye yayılacak adım miktarı
+    uint32_t steps_per_interval   = 1;
 
-    int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE); // Örn: 500 ms
+    int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
-    ESP_LOGI(TAG, "ASIC Job Interval: %d ms | Target 10s Window Step Rolling", timeout_ms);
+    ESP_LOGI(TAG, "ASIC Job Interval: %d ms | Safe Step Rolling Active", timeout_ms);
 
     while (1) {
         uint64_t start_time   = esp_timer_get_time();
@@ -117,7 +115,6 @@ void create_jobs_task(void *pvParameters)
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
 
-            // Eğer iş sadece bir refresh ise ve clean_jobs false ise atla
             if (!new_work->clean_jobs && current_work != NULL) {
                 timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
                 continue;
@@ -130,18 +127,15 @@ void create_jobs_task(void *pvParameters)
             current_work_sent   = false;
             version_rolls_done  = 0;
 
-            // Maske hesaplama ve toplam kombinasyon tespiti
             uint32_t mask = (new_work->version_mask != 0) ? new_work->version_mask : BIP320_VERSION_ROLLING_MASK;
             int bits = __builtin_popcount(mask);
             version_rolls_total = (bits >= 32) ? 0xFFFFFFFFu : (1u << bits);
 
-            // 10 saniyelik ömrü (TARGET_JOB_LIFETIME_MS), ASIC'in iş gönderme sıklığına (timeout_ms) bölerek
-            // her turda atılması gereken adım (chunk) miktarını hesaplıyoruz.
             int ticks_in_10s = TARGET_JOB_LIFETIME_MS / (timeout_ms > 0 ? timeout_ms : 500);
             steps_per_interval = version_rolls_total / (ticks_in_10s > 0 ? ticks_in_10s : 1);
             if (steps_per_interval == 0) steps_per_interval = 1;
 
-            ESP_LOGI(TAG, "Versiyon Uzayı: %lu kombinasyon, Her 500ms adım: %lu", 
+            ESP_LOGI(TAG, "Versiyon Uzayı: %lu kombinasyon, Her adım: %lu", 
                      (unsigned long)version_rolls_total, (unsigned long)steps_per_interval);
 
             if (new_work->version_mask != current_version_mask && GLOBAL_STATE->ASIC_initalized) {
@@ -154,32 +148,35 @@ void create_jobs_task(void *pvParameters)
                 continue;
             }
 
-            // Eğer 10 saniyelik aralıkta bütün versiyon uzayı taranıp bittiyse yeni işi beklet
+            // GÜVENLİK KONTROLÜ: Versiyon uzayı bittiyse duplicate share atmamak için beklet
             if (version_rolls_done >= version_rolls_total) {
-                vTaskDelay(pdMS_TO_TICKS(100));
+                ESP_LOGD(TAG, "Versiyon aralığı tamamlandı, yeni iş bekleniyor...");
+                vTaskDelay(pdMS_TO_TICKS(250));
                 continue;
             }
         }
 
-        // Hesaplanan güncel versiyon ile işi üret ve ASIC'e gönder
-        generate_work_from_miner_job(GLOBAL_STATE, current_work, current_version);
+        // Eğer uzay dolduysa iş göndermeyi atla
+        if (version_rolls_done < version_rolls_total) {
+            generate_work_from_miner_job(GLOBAL_STATE, current_work, current_version);
 
-        if (!current_work_sent) {
-            SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
-        }
-        current_work_sent = true;
+            if (!current_work_sent) {
+                SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
+            }
+            current_work_sent = true;
 
-        // 10 saniyelik süreye yaymak için her döngüde versiyonu hesaplanan adım büyüklüğü kadar artırıyoruz
-        uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
-        uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
+            // Versiyonu bir sonraki adım için ilerlet
+            uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
+            uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
 
-        for (uint32_t s = 0; s < steps_per_interval; s++) {
-            for (int i = 0; i < midstates; i++) {
-                current_version = increment_bitmask(current_version, mask);
-                version_rolls_done++;
+            for (uint32_t s = 0; s < steps_per_interval; s++) {
+                for (int i = 0; i < midstates; i++) {
+                    current_version = increment_bitmask(current_version, mask);
+                    version_rolls_done++;
+                    if (version_rolls_done >= version_rolls_total) break;
+                }
                 if (version_rolls_done >= version_rolls_total) break;
             }
-            if (version_rolls_done >= version_rolls_total) break;
         }
 
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
