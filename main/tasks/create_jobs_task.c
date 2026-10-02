@@ -5,6 +5,7 @@
 #include "global_state.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_random.h"  // Toegevoegd om de compilerfout op te lossen
 #include "mining.h"
 #include "miner_job.h"
 #include "string.h"
@@ -148,7 +149,6 @@ void create_jobs_task(void *pvParameters)
             }
         }
 
-        // Aanroep zonder extranonce_2 variabele omdat deze nu random in de functie wordt gegenereerd
         generate_work_from_miner_job(GLOBAL_STATE, current_work, current_version);
         if (!current_work_sent) {
             SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
