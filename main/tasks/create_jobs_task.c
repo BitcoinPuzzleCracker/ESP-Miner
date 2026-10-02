@@ -59,7 +59,17 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
             for (size_t i = 0; i < e2_len && i < sizeof(uint64_t); i++) {
                 extranonce_2_bin[e2_len - 1 - i] = (val >> (8 * i)) & 0xFF;
             }
-            bin2hex(extranonce_2_bin, e2_len, extranonce_2_str, sizeof(extranonce_2_str));
+            
+            // Genereer eerst de normale hex string met nullen
+            char temp_hex[MAX_EXTRANONCE2_STR] = "";
+            bin2hex(extranonce_2_bin, e2_len, temp_hex, sizeof(temp_hex));
+
+            // Strip de voorloopnullen weg (zorg dat er minimaal '0' overblijft als extranonce_2 = 0)
+            char *p = temp_hex;
+            while (*p == '0' && *(p + 1) != '\0') {
+                p++;
+            }
+            snprintf(extranonce_2_str, sizeof(extranonce_2_str), "%s", p);
         }
 
         uint8_t coinbase_tx_hash[32];
