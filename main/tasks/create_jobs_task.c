@@ -20,7 +20,7 @@ static const char *TAG = "create_jobs_task";
 #define MAX_EXTRANONCE2_LEN 32
 #define MAX_EXTRANONCE2_STR (MAX_EXTRANONCE2_LEN * 2 + 1)
 
-static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_job_t *job, uint64_t extranonce_2, uint32_t current_version)
+static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_job_t *job, uint32_t current_version)
 {
     if (!job) return;
 
@@ -53,23 +53,15 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
 
         uint8_t extranonce_2_bin[MAX_EXTRANONCE2_LEN] = {0};
         if (e2_len > 0) {
-            // Vul de buffer van rechts naar linkerzijde (Big-Endian stijl)
-            // zodat extranonce_2 = 1 oploopt aan de rechterkant van de hex-string.
-            uint64_t val = extranonce_2;
-            for (size_t i = 0; i < e2_len && i < sizeof(uint64_t); i++) {
-                extranonce_2_bin[e2_len - 1 - i] = (val >> (8 * i)) & 0xFF;
+            // Genereer willekeurige bytes voor extranonce_2 binnen de toegestane lengte (e2_len)
+            for (size_t i = 0; i < e2_len; i += 4) {
+                uint32_t rand_val = esp_random();
+                size_t chunk = (e2_len - i < 4) ? (e2_len - i) : 4;
+                for (size_t j = 0; j < chunk; j++) {
+                    extranonce_2_bin[i + j] = (rand_val >> (8 * j)) & 0xFF;
+                }
             }
-            
-            // Genereer eerst de normale hex string met nullen
-            char temp_hex[MAX_EXTRANONCE2_STR] = "";
-            bin2hex(extranonce_2_bin, e2_len, temp_hex, sizeof(temp_hex));
-
-            // Strip de voorloopnullen weg (zorg dat er minimaal '0' overblijft als extranonce_2 = 0)
-            char *p = temp_hex;
-            while (*p == '0' && *(p + 1) != '\0') {
-                p++;
-            }
-            snprintf(extranonce_2_str, sizeof(extranonce_2_str), "%s", p);
+            bin2hex(extranonce_2_bin, e2_len, extranonce_2_str, sizeof(extranonce_2_str));
         }
 
         uint8_t coinbase_tx_hash[32];
@@ -111,13 +103,9 @@ void create_jobs_task(void *pvParameters)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
 
-    // active_jobs / valid_jobs are allocated and zeroed by SYSTEM_init_system(),
-    // before any task that touches them can run.
-
     uint32_t current_version_mask = 0;
     miner_job_t *current_work = NULL;
     bool current_work_sent = false;
-    uint64_t extranonce_2 = 0;
     uint32_t current_version = 0;
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
@@ -145,8 +133,6 @@ void create_jobs_task(void *pvParameters)
                 current_version_mask = new_work->version_mask;
             }
 
-            extranonce_2 = 0;
-
             if (!current_work->clean_jobs) {
                 // Staged job for next cycle, let current ASIC cycle finish
                 continue;
@@ -162,16 +148,15 @@ void create_jobs_task(void *pvParameters)
             }
         }
 
-        generate_work_from_miner_job(GLOBAL_STATE, current_work, extranonce_2, current_version);
+        // Aanroep zonder extranonce_2 variabele omdat deze nu random in de functie wordt gegenereerd
+        generate_work_from_miner_job(GLOBAL_STATE, current_work, current_version);
         if (!current_work_sent) {
             SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
         }
         current_work_sent = true;
 
-        if (miner_job_is_rollable(current_work)) {
-            extranonce_2++;
-        } else if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
-            // Software version rolling for ASICs without hardware version rolling (e.g. BM1397) on SV2 Standard Channel
+        if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling && !miner_job_is_rollable(current_work)) {
+            // Software version rolling voor ASICs zonder hardware version rolling (bijv. BM1397) op SV2 Standard Channel
             uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
             uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
             for (int i = 0; i < midstates; i++) {
