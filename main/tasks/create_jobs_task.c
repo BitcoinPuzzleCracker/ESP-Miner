@@ -5,7 +5,7 @@
 #include "global_state.h"
 #include "esp_log.h"
 #include "esp_system.h"
-#include "esp_random.h"  // Toegevoegd om de compilerfout op te lossen
+#include "esp_random.h"  // Toegevoegd om de compilerfout op te lossen[span_1](start_span)[span_1](end_span)
 #include "mining.h"
 #include "miner_job.h"
 #include "string.h"
@@ -54,19 +54,21 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
 
         uint8_t extranonce_2_bin[MAX_EXTRANONCE2_LEN] = {0};
         if (e2_len > 0) {
-            // FIX: Bepaal een dynamische lengte tussen 1 en e2_len zodat zowel kleine als grote extranonce 2 waarden worden getest
-            size_t current_e2_len = (esp_random() % e2_len) + 1;
-            memset(extranonce_2_bin, 0, MAX_EXTRANONCE2_LEN);
-
-            // Genereer willekeurige bytes binnen deze dynamische lengte
-            for (size_t i = 0; i < current_e2_len; i += 4) {
-                uint32_t rand_val = esp_random();
-                size_t chunk = (current_e2_len - i < 4) ? (current_e2_len - i) : 4;
-                for (size_t j = 0; j < chunk; j++) {
-                    extranonce_2_bin[i + j] = (rand_val >> (8 * j)) & 0xFF;
+            // Genereer een echte, volledige willekeurige 32-bits waarde
+            uint32_t rand_val = esp_random();
+            
+            size_t bytes_to_fill = (e2_len < 4) ? e2_len : 4;
+            
+            for (size_t i = 0; i < e2_len; i++) {
+                // Vul de rechterkant volledig willekeurig, de linkerkant blijft 0
+                if (i >= e2_len - bytes_to_fill) {
+                    size_t j = i - (e2_len - bytes_to_fill);
+                    extranonce_2_bin[i] = (rand_val >> (8 * (bytes_to_fill - 1 - j))) & 0xFF;
+                } else {
+                    extranonce_2_bin[i] = 0;
                 }
             }
-            bin2hex(extranonce_2_bin, current_e2_len, extranonce_2_str, sizeof(extranonce_2_str));
+            bin2hex(extranonce_2_bin, e2_len, extranonce_2_str, sizeof(extranonce_2_str));
         }
 
         uint8_t coinbase_tx_hash[32];
@@ -138,7 +140,8 @@ void create_jobs_task(void *pvParameters)
                 current_version_mask = new_work->version_mask;
             }
 
-            if (!current_work->clean_jobs) {
+            if (!new_work->clean_jobs) {
+                // Staged job for next cycle, let current ASIC cycle finish
                 continue;
             }
         } else {
@@ -159,6 +162,7 @@ void create_jobs_task(void *pvParameters)
         current_work_sent = true;
 
         if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling && !miner_job_is_rollable(current_work)) {
+            // Software version rolling voor ASICs zonder hardware version rolling (bijv. BM1397) op SV2 Standard Channel
             uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
             uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
             for (int i = 0; i < midstates; i++) {
