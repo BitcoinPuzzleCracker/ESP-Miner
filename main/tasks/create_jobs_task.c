@@ -5,7 +5,7 @@
 #include "global_state.h"
 #include "esp_log.h"
 #include "esp_system.h"
-#include "esp_random.h"  // Toegevoegd om de compilerfout op te lossen[span_1](start_span)[span_1](end_span)
+#include "esp_random.h"  // Toegevoegd om de compilerfout op te lossen[span_0](start_span)[span_0](end_span)
 #include "mining.h"
 #include "miner_job.h"
 #include "string.h"
@@ -54,13 +54,13 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
 
         uint8_t extranonce_2_bin[MAX_EXTRANONCE2_LEN] = {0};
         if (e2_len > 0) {
-            // Genereer een echte, volledige willekeurige 32-bits waarde
-            uint32_t rand_val = esp_random();
+            // Genereer een kleinere willekeurige waarde (gemaskeerd met 0xFFFF zodat het klein blijft)
+            uint32_t rand_val = esp_random() & 0xFFFF;
             
             size_t bytes_to_fill = (e2_len < 4) ? e2_len : 4;
             
             for (size_t i = 0; i < e2_len; i++) {
-                // Vul de rechterkant volledig willekeurig, de linkerkant blijft 0
+                // Vul de rechterkant willekeurig (klein gehouden), de linkerkant blijft 0
                 if (i >= e2_len - bytes_to_fill) {
                     size_t j = i - (e2_len - bytes_to_fill);
                     extranonce_2_bin[i] = (rand_val >> (8 * (bytes_to_fill - 1 - j))) & 0xFF;
