@@ -54,16 +54,19 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
 
         uint8_t extranonce_2_bin[MAX_EXTRANONCE2_LEN] = {0};
         if (e2_len > 0) {
-            // Genereer een kleinere willekeurige waarde (gemaskeerd met 0xFFFF zodat het klein blijft)
-            uint32_t rand_val = esp_random() & 0xFFFF;
-            
-            size_t bytes_to_fill = (e2_len < 4) ? e2_len : 4;
+            // Kies bij elke job automatisch en willekeurig hoeveel bytes we vullen (tussen 1 en 4 bytes, afhankelijk van e2_len)
+            size_t random_bytes_count = (esp_random() % 4) + 1; 
+            if (random_bytes_count > e2_len) {
+                random_bytes_count = e2_len;
+            }
+
+            uint32_t rand_val = esp_random();
             
             for (size_t i = 0; i < e2_len; i++) {
-                // Vul de rechterkant willekeurig (klein gehouden), de linkerkant blijft 0
-                if (i >= e2_len - bytes_to_fill) {
-                    size_t j = i - (e2_len - bytes_to_fill);
-                    extranonce_2_bin[i] = (rand_val >> (8 * (bytes_to_fill - 1 - j))) & 0xFF;
+                // Plaats de willekeurige bytes aan de rechterkant, de linkerkant blijft 0
+                if (i >= e2_len - random_bytes_count) {
+                    size_t j = i - (e2_len - random_bytes_count);
+                    extranonce_2_bin[i] = (rand_val >> (8 * (random_bytes_count - 1 - j))) & 0xFF;
                 } else {
                     extranonce_2_bin[i] = 0;
                 }
