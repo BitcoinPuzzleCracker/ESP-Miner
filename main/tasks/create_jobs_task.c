@@ -5,7 +5,6 @@
 #include "global_state.h"
 #include "esp_log.h"
 #include "esp_system.h"
-#include "esp_random.h"  // Toegevoegd om de compilerfout op te lossen[span_0](start_span)[span_0](end_span)
 #include "mining.h"
 #include "miner_job.h"
 #include "string.h"
@@ -52,29 +51,17 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
             return;
         }
 
-        uint8_t extranonce_2_bin[MAX_EXTRANONCE2_LEN] = {0};
+        // Automatisch extranonce 2 opvullen met nullen op basis van de gevraagde byte-lengte (e2_len * 2 hex karakters)
         if (e2_len > 0) {
-            // Kies bij elke job automatisch en willekeurig hoeveel bytes we vullen (tussen 1 en 4 bytes, afhankelijk van e2_len)
-            size_t random_bytes_count = (esp_random() % 4) + 1; 
-            if (random_bytes_count > e2_len) {
-                random_bytes_count = e2_len;
-            }
-
-            uint32_t rand_val = esp_random();
-            
-            for (size_t i = 0; i < e2_len; i++) {
-                // Plaats de willekeurige bytes aan de rechterkant, de linkerkant blijft 0
-                if (i >= e2_len - random_bytes_count) {
-                    size_t j = i - (e2_len - random_bytes_count);
-                    extranonce_2_bin[i] = (rand_val >> (8 * (random_bytes_count - 1 - j))) & 0xFF;
-                } else {
-                    extranonce_2_bin[i] = 0;
-                }
-            }
-            bin2hex(extranonce_2_bin, e2_len, extranonce_2_str, sizeof(extranonce_2_str));
+            size_t hex_len = e2_len * 2;
+            if (hex_len >= MAX_EXTRANONCE2_STR) hex_len = MAX_EXTRANONCE2_STR - 1;
+            memset(extranonce_2_str, '0', hex_len);
+            extranonce_2_str[hex_len] = '\0';
         }
 
+        uint8_t extranonce_2_bin[MAX_EXTRANONCE2_LEN] = {0};
         uint8_t coinbase_tx_hash[32];
+        
         calculate_coinbase_tx_hash_bin(job->coinbase_prefix, job->coinbase_prefix_len,
                                        job->extranonce1, job->extranonce1_len,
                                        extranonce_2_bin, e2_len,
@@ -143,8 +130,7 @@ void create_jobs_task(void *pvParameters)
                 current_version_mask = new_work->version_mask;
             }
 
-            if (!new_work->clean_jobs) {
-                // Staged job for next cycle, let current ASIC cycle finish
+            if (!current_work->clean_jobs) {
                 continue;
             }
         } else {
@@ -165,7 +151,6 @@ void create_jobs_task(void *pvParameters)
         current_work_sent = true;
 
         if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling && !miner_job_is_rollable(current_work)) {
-            // Software version rolling voor ASICs zonder hardware version rolling (bijv. BM1397) op SV2 Standard Channel
             uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
             uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
             for (int i = 0; i < midstates; i++) {
