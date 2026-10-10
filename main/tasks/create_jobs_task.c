@@ -76,7 +76,6 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
                                    job->merkle_path_count, merkle_root);
     }
 
-    // Gebruik de actuele doorlopende versie in plaats van telkens de basisversie
     construct_bm_job_from_miner_job(job, current_version, merkle_root, version_mask, job_diff, GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates, next_job);
     next_job->jobid = strdup(job->job_id);
     next_job->extranonce2 = strdup(extranonce_2_str);
@@ -127,7 +126,7 @@ void create_jobs_task(void *pvParameters)
             GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
             current_work_sent = false;
             
-            // Alleen initialiseren als er nog geen versie actief was, zodat deze doorloopt over jobs heen
+            // Versiyonun sıfırlanmasını önleyerek kaldığı yerden devam etmesi sağlanıyor
             if (current_version == 0) {
                 current_version = new_work->version;
             }
@@ -158,7 +157,7 @@ void create_jobs_task(void *pvParameters)
         }
         current_work_sent = true;
 
-        // Versie verhogen voor de volgende iteratie zodat het bereik blijft rollen
+        // Maske sınırları içerisinde versiyonu kademeli olarak artır
         uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
         current_version = increment_bitmask(current_version, mask);
 
