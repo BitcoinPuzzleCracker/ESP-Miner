@@ -5,7 +5,7 @@
 #include "global_state.h"
 #include "esp_log.h"
 #include "esp_system.h"
-#include "esp_random.h"  // Toegevoegd om de compilerfout op te lossen
+#include "esp_random.h"
 #include "mining.h"
 #include "miner_job.h"
 #include "string.h"
@@ -54,7 +54,6 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
 
         uint8_t extranonce_2_bin[MAX_EXTRANONCE2_LEN] = {0};
         if (e2_len > 0) {
-            // Genereer willekeurige bytes voor extranonce_2 binnen de toegestane lengte (e2_len)
             for (size_t i = 0; i < e2_len; i += 4) {
                 uint32_t rand_val = esp_random();
                 size_t chunk = (e2_len - i < 4) ? (e2_len - i) : 4;
@@ -108,6 +107,11 @@ void create_jobs_task(void *pvParameters)
     miner_job_t *current_work = NULL;
     bool current_work_sent = false;
     uint32_t current_version = 0;
+    
+    // We bewaren de vorige Merkle root / block data identificatie om te controleren of het blok echt gewijzigd is
+    uint8_t last_merkle_root[32] = {0};
+    bool has_last_merkle = false;
+
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
@@ -123,14 +127,36 @@ void create_jobs_task(void *pvParameters)
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
             
-            // Controleer of dit daadwerkelijk een nieuwe job/template is (op basis van job_id)
-            if (current_work == NULL || strcmp(new_work->job_id, current_work->job_id) != 0) {
-                ESP_LOGI(TAG, "Nieuwe Block Template / Job Ontvangen: %s (slot %lu)", new_work->job_id, (unsigned long)slot_notify);
+            // Bepaal de merkle root van de nieuwe job om te controleren op een echt nieuw blok
+            uint8_t new_merkle_root[32];
+            if (new_work->type == JOB_TYPE_SV2_STANDARD) {
+                memcpy(new_merkle_root, new_work->merkle_root, 32);
+            } else {
+                // Bereken voorlopige merkle root op basis van prefix/suffix om template-wijziging te detecteren
+                uint8_t temp_coinbase[32];
+                calculate_coinbase_tx_hash_bin(new_work->coinbase_prefix, new_work->coinbase_prefix_len,
+                                               new_work->extranonce1, new_work->extranonce1_len,
+                                               (const uint8_t*)new_work->extranonce2, 0,
+                                               new_work->coinbase_suffix, new_work->coinbase_suffix_len,
+                                               temp_coinbase);
+                calculate_merkle_root_hash(temp_coinbase,
+                                           (const uint8_t (*)[32])new_work->merkle_path,
+                                           new_work->merkle_path_count, new_merkle_root);
+            }
+
+            // Check of de blok-gegevens (merkle root) daadwerkelijk anders zijn dan de vorige
+            bool is_new_block = !has_last_merkle || (memcmp(new_merkle_root, last_merkle_root, 32) != 0);
+
+            if (is_new_block) {
+                ESP_LOGI(TAG, "Nieuwe Blok Gegevens / Template Ontvangen! Versie wordt gereset.");
+                memcpy(last_merkle_root, new_merkle_root, 32);
+                has_last_merkle = true;
                 current_work = new_work;
-                current_version = new_work->version; // Pas bij een echt nieuw blok resetten we de versie
+                current_version = new_work->version; // Echte reset pas bij een nieuw blok
                 current_work_sent = false;
             } else {
-                ESP_LOGI(TAG, "Zelfde job ID ontvangen, doorrollen op bestaande template");
+                ESP_LOGI(TAG, "Zelfde blok-template ontvangen, doorrollen zonder reset.");
+                current_work = new_work; // Update referentie maar behoud current_version
             }
 
             GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
@@ -142,7 +168,6 @@ void create_jobs_task(void *pvParameters)
             }
 
             if (!current_work->clean_jobs && current_work_sent) {
-                // Staged job for next cycle, let current ASIC cycle finish
                 continue;
             }
         } else {
@@ -158,7 +183,7 @@ void create_jobs_task(void *pvParameters)
         }
         current_work_sent = true;
 
-        // Blijf de versie continu ophogen zolang er geen nieuwe blok-template binnenkomt
+        // Blijf de versie continu ophogen totdat er daadwerkelijk een nieuwe blok-template binnenkomt[span_1](start_span)[span_1](end_span)
         uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
         uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
         if (midstates == 0) midstates = 1;
