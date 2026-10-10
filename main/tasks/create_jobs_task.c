@@ -108,7 +108,6 @@ void create_jobs_task(void *pvParameters)
     bool current_work_sent = false;
     uint32_t current_version = 0;
     
-    // We bewaren de vorige Merkle root / block data identificatie om te controleren of het blok echt gewijzigd is
     uint8_t last_merkle_root[32] = {0};
     bool has_last_merkle = false;
 
@@ -127,16 +126,14 @@ void create_jobs_task(void *pvParameters)
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
             
-            // Bepaal de merkle root van de nieuwe job om te controleren op een echt nieuw blok
             uint8_t new_merkle_root[32];
             if (new_work->type == JOB_TYPE_SV2_STANDARD) {
                 memcpy(new_merkle_root, new_work->merkle_root, 32);
             } else {
-                // Bereken voorlopige merkle root op basis van prefix/suffix om template-wijziging te detecteren
                 uint8_t temp_coinbase[32];
                 calculate_coinbase_tx_hash_bin(new_work->coinbase_prefix, new_work->coinbase_prefix_len,
                                                new_work->extranonce1, new_work->extranonce1_len,
-                                               (const uint8_t*)new_work->extranonce2, 0,
+                                               NULL, 0,
                                                new_work->coinbase_suffix, new_work->coinbase_suffix_len,
                                                temp_coinbase);
                 calculate_merkle_root_hash(temp_coinbase,
@@ -144,7 +141,6 @@ void create_jobs_task(void *pvParameters)
                                            new_work->merkle_path_count, new_merkle_root);
             }
 
-            // Check of de blok-gegevens (merkle root) daadwerkelijk anders zijn dan de vorige
             bool is_new_block = !has_last_merkle || (memcmp(new_merkle_root, last_merkle_root, 32) != 0);
 
             if (is_new_block) {
@@ -152,11 +148,11 @@ void create_jobs_task(void *pvParameters)
                 memcpy(last_merkle_root, new_merkle_root, 32);
                 has_last_merkle = true;
                 current_work = new_work;
-                current_version = new_work->version; // Echte reset pas bij een nieuw blok
+                current_version = new_work->version;
                 current_work_sent = false;
             } else {
                 ESP_LOGI(TAG, "Zelfde blok-template ontvangen, doorrollen zonder reset.");
-                current_work = new_work; // Update referentie maar behoud current_version
+                current_work = new_work;
             }
 
             GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
@@ -183,7 +179,6 @@ void create_jobs_task(void *pvParameters)
         }
         current_work_sent = true;
 
-        // Blijf de versie continu ophogen totdat er daadwerkelijk een nieuwe blok-template binnenkomt[span_1](start_span)[span_1](end_span)
         uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
         uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
         if (midstates == 0) midstates = 1;
