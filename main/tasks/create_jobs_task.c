@@ -182,18 +182,23 @@ void create_jobs_task(void *pvParameters)
         }
         current_work_sent = true;
 
-        /* Hem software hem hardware version rolling icin base version'i ilerlet
-         * ki her ASIC job cycle'inda farkli bir pencere taransin. Boylece
+        /* Hem software hem hardware version rolling icin her cycle'da base
+         * version'i ilerlet. Gate yok — BM1370'te de calisir. Boylece
          * "kucuk dongude gidip gelme" sorunu ortadan kalkar. */
-        if (!miner_job_is_rollable(current_work)) {
+        {
             uint32_t mask = (current_work->version_mask != 0)
                             ? current_work->version_mask
                             : BIP320_VERSION_ROLLING_MASK;
-            uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
-            if (midstates == 0) midstates = 1;  /* en az 1 adim ilerle */
-            for (int i = 0; i < midstates; i++) {
-                current_version = increment_bitmask(current_version, mask);
+            uint32_t base = current_work->version & ~mask;
+            uint32_t offset = current_version & mask;
+            /* Mask'in ~1/8'i kadar adim -> 8 cycle'da tum aralik taranir */
+            uint32_t step = (mask >> 3) & mask;
+            if (step == 0) {
+                /* mask tek bit ise en kucuk bitini kullan */
+                step = (mask != 0) ? (mask & (uint32_t)(-(int32_t)mask)) : 0x2000;
             }
+            offset = (offset + step) & mask;
+            current_version = base | offset;
             rolling_state = current_version;
         }
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
