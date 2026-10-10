@@ -108,8 +108,9 @@ void create_jobs_task(void *pvParameters)
     bool current_work_sent = false;
     uint32_t current_version = 0;
     
-    uint8_t last_merkle_root[32] = {0};
-    bool has_last_merkle = false;
+    // Bewaar de vorige prevhash / block hash om een echt nieuw blok te detecteren
+    char last_prevhash[64] = {0};
+    bool has_last_prevhash = false;
 
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
@@ -126,32 +127,31 @@ void create_jobs_task(void *pvParameters)
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
             
-            uint8_t new_merkle_root[32];
-            if (new_work->type == JOB_TYPE_SV2_STANDARD) {
-                memcpy(new_merkle_root, new_work->merkle_root, 32);
+            // Controleer of de prevhash (blok hash van vorig blok) daadwerkelijk is veranderd.
+            // Als de pool alleen de job_id verandert maar de prevhash is hetzelfde, is het GEEN nieuw blok.
+            bool is_new_block = false;
+            if (new_work->prevhash) {
+                if (!has_last_prevhash || strcmp(new_work->prevhash, last_prevhash) != 0) {
+                    is_new_block = true;
+                    strncpy(last_prevhash, new_work->prevhash, sizeof(last_prevhash) - 1);
+                    has_last_prevhash = true;
+                }
             } else {
-                uint8_t temp_coinbase[32];
-                calculate_coinbase_tx_hash_bin(new_work->coinbase_prefix, new_work->coinbase_prefix_len,
-                                               new_work->extranonce1, new_work->extranonce1_len,
-                                               NULL, 0,
-                                               new_work->coinbase_suffix, new_work->coinbase_suffix_len,
-                                               temp_coinbase);
-                calculate_merkle_root_hash(temp_coinbase,
-                                           (const uint8_t (*)[32])new_work->merkle_path,
-                                           new_work->merkle_path_count, new_merkle_root);
+                // Fallback als prevhash niet direct beschikbaar is: vergelijk op basis van clean_jobs vlag
+                if (new_work->clean_jobs) {
+                    is_new_block = true;
+                }
             }
 
-            bool is_new_block = !has_last_merkle || (memcmp(new_merkle_root, last_merkle_root, 32) != 0);
-
             if (is_new_block) {
-                ESP_LOGI(TAG, "Nieuwe Blok Gegevens / Template Ontvangen! Versie wordt gereset.");
-                memcpy(last_merkle_root, new_merkle_root, 32);
-                has_last_merkle = true;
+                ESP_LOGI(TAG, ">>> ECHT NIEUW BLOK ONTVANGEN! Versie en rolling worden gereset.");
                 current_work = new_work;
                 current_version = new_work->version;
                 current_work_sent = false;
             } else {
-                ESP_LOGI(TAG, "Zelfde blok-template ontvangen, doorrollen zonder reset.");
+                // Tussentijdse job van pool genegeerd qua reset: we rollen stug door op de huidige template!
+                ESP_LOGI(TAG, "Tussentijdse job-update genegeerd voor reset, doorrollen op huidige template.");
+                // We updaten wel de pointer voor eventuele pointers, maar behouden de lopende current_version!
                 current_work = new_work;
             }
 
@@ -163,7 +163,7 @@ void create_jobs_task(void *pvParameters)
                 current_version_mask = new_work->version_mask;
             }
 
-            if (!current_work->clean_jobs && current_work_sent) {
+            if (!current_work->clean_jobs && current_work_sent && !is_new_block) {
                 continue;
             }
         } else {
@@ -179,6 +179,7 @@ void create_jobs_task(void *pvParameters)
         }
         current_work_sent = true;
 
+        // Blijf onverstoorbaar doorrollen binnen het masker
         uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
         uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
         if (midstates == 0) midstates = 1;
