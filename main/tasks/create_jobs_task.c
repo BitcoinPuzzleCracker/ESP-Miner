@@ -126,7 +126,6 @@ void create_jobs_task(void *pvParameters)
             GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
             current_work_sent = false;
             
-            // Versiyonun sıfırlanmasını önleyerek kaldığı yerden devam etmesi sağlanıyor
             if (current_version == 0) {
                 current_version = new_work->version;
             }
@@ -157,9 +156,10 @@ void create_jobs_task(void *pvParameters)
         }
         current_work_sent = true;
 
-        // Maske sınırları içerisinde versiyonu kademeli olarak artır
+        // Maske sınırlarını güvenli uygula: Başlık bozulmasını engellemek için taban versiyon korunuyor
         uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
-        current_version = increment_bitmask(current_version, mask);
+        uint32_t rolled = increment_bitmask(current_version & mask, mask);
+        current_version = (current_work->version & ~mask) | (rolled & mask);
 
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
     }
