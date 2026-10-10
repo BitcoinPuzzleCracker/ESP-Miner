@@ -108,7 +108,6 @@ void create_jobs_task(void *pvParameters)
     bool current_work_sent = false;
     uint32_t current_version = 0;
     
-    // Bewaar de vorige prevhash / block hash om een echt nieuw blok te detecteren
     char last_prevhash[64] = {0};
     bool has_last_prevhash = false;
 
@@ -127,17 +126,14 @@ void create_jobs_task(void *pvParameters)
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
             
-            // Controleer of de prevhash (blok hash van vorig blok) daadwerkelijk is veranderd.
-            // Als de pool alleen de job_id verandert maar de prevhash is hetzelfde, is het GEEN nieuw blok.
             bool is_new_block = false;
-            if (new_work->prevhash) {
-                if (!has_last_prevhash || strcmp(new_work->prevhash, last_prevhash) != 0) {
+            if (new_work->prev_hash) {
+                if (!has_last_prevhash || strcmp(new_work->prev_hash, last_prevhash) != 0) {
                     is_new_block = true;
-                    strncpy(last_prevhash, new_work->prevhash, sizeof(last_prevhash) - 1);
+                    strncpy(last_prevhash, new_work->prev_hash, sizeof(last_prevhash) - 1);
                     has_last_prevhash = true;
                 }
             } else {
-                // Fallback als prevhash niet direct beschikbaar is: vergelijk op basis van clean_jobs vlag
                 if (new_work->clean_jobs) {
                     is_new_block = true;
                 }
@@ -149,9 +145,7 @@ void create_jobs_task(void *pvParameters)
                 current_version = new_work->version;
                 current_work_sent = false;
             } else {
-                // Tussentijdse job van pool genegeerd qua reset: we rollen stug door op de huidige template!
                 ESP_LOGI(TAG, "Tussentijdse job-update genegeerd voor reset, doorrollen op huidige template.");
-                // We updaten wel de pointer voor eventuele pointers, maar behouden de lopende current_version!
                 current_work = new_work;
             }
 
@@ -179,7 +173,6 @@ void create_jobs_task(void *pvParameters)
         }
         current_work_sent = true;
 
-        // Blijf onverstoorbaar doorrollen binnen het masker
         uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
         uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
         if (midstates == 0) midstates = 1;
