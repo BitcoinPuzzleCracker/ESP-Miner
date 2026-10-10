@@ -37,10 +37,8 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
     uint8_t merkle_root[32];
     char extranonce_2_str[MAX_EXTRANONCE2_STR] = "";
 
-    /* Hem software hem hardware version rolling'de base version'i kullan,
-     * boylece biriken rolling state'i ASIC'e aktarilir. */
     uint32_t effective_version = job->version;
-    if (!miner_job_is_rollable(job) || GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
+    if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling && !miner_job_is_rollable(job)) {
         effective_version = current_version;
     }
 
@@ -110,14 +108,6 @@ void create_jobs_task(void *pvParameters)
     miner_job_t *current_work = NULL;
     bool current_work_sent = false;
     uint32_t current_version = 0;
-
-    /* Version rolling state: pool'un base version'i (mask disi bitler)
-     * degismedigi surece biriken rolling state'i koruruz. Yeni block/notify
-     * geldiginde base degisirse sifirlanir. */
-    uint32_t rolling_state  = 0;
-    uint32_t rolling_base   = 0;
-    bool     rolling_inited = false;
-
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
@@ -132,27 +122,11 @@ void create_jobs_task(void *pvParameters)
 
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
-            ESP_LOGI(TAG, "New Work Activated (slot %lu) %s (type %d)",
-                     (unsigned long)slot_notify, new_work->job_id, new_work->type);
+            ESP_LOGI(TAG, "New Work Activated (slot %lu) %s (type %d)", (unsigned long)slot_notify, new_work->job_id, new_work->type);
             current_work = new_work;
             GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
             current_work_sent = false;
-
-            /* Sadece pool'un base version'i (mask disi bitler) degistiyse reset.
-             * Aksi halde ayni block icindeki ardisik notify'larda rolling state
-             * korunur ve ASIC bir sonraki job'da kaldigi yerden devam eder. */
-            uint32_t new_base = new_work->version & ~new_work->version_mask;
-            if (!rolling_inited || new_base != (rolling_base & ~new_work->version_mask)) {
-                rolling_state  = new_work->version;
-                rolling_base   = new_work->version;
-                rolling_inited = true;
-                ESP_LOGI(TAG, "Version rolling RESET  base=0x%08" PRIx32 " state=0x%08" PRIx32,
-                         rolling_base, rolling_state);
-            } else {
-                ESP_LOGI(TAG, "Version rolling KEEP   base=0x%08" PRIx32 " state=0x%08" PRIx32,
-                         rolling_base, rolling_state);
-            }
-            current_version = rolling_state;
+            current_version = new_work->version;
 
             if (new_work->version_mask != current_version_mask && GLOBAL_STATE->ASIC_initalized) {
                 ESP_LOGI(TAG, "Set chip version rolls %i", (int)(new_work->version_mask >> 13));
@@ -169,11 +143,7 @@ void create_jobs_task(void *pvParameters)
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 continue;
             }
-            if (!miner_job_is_rollable(current_work) && current_work_sent &&
-                GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
-                timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
-                continue;
-            }
+            // De vroege afbreekvoorwaarde is hier verwijderd zodat het doorrollen doorgaat[span_1](start_span)[span_1](end_span).
         }
 
         generate_work_from_miner_job(GLOBAL_STATE, current_work, current_version);
@@ -182,25 +152,15 @@ void create_jobs_task(void *pvParameters)
         }
         current_work_sent = true;
 
-        /* Hem software hem hardware version rolling icin her cycle'da base
-         * version'i ilerlet. Gate yok — BM1370'te de calisir. Boylece
-         * "kucuk dongude gidip gelme" sorunu ortadan kalkar. */
-        {
-            uint32_t mask = (current_work->version_mask != 0)
-                            ? current_work->version_mask
-                            : BIP320_VERSION_ROLLING_MASK;
-            uint32_t base = current_work->version & ~mask;
-            uint32_t offset = current_version & mask;
-            /* Mask'in ~1/8'i kadar adim -> 8 cycle'da tum aralik taranir */
-            uint32_t step = (mask >> 3) & mask;
-            if (step == 0) {
-                /* mask tek bit ise en kucuk bitini kullan */
-                step = (mask != 0) ? (mask & (uint32_t)(-(int32_t)mask)) : 0x2000;
-            }
-            offset = (offset + step) & mask;
-            current_version = base | offset;
-            rolling_state = current_version;
+        // Blijf de versie continu ophogen totdat een nieuwe job wordt aangemeld[span_2](start_span)[span_2](end_span)
+        uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
+        uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
+        if (midstates == 0) midstates = 1;
+
+        for (int i = 0; i < midstates; i++) {
+            current_version = increment_bitmask(current_version, mask);
         }
+
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
     }
 }
