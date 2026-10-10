@@ -122,11 +122,18 @@ void create_jobs_task(void *pvParameters)
 
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
-            ESP_LOGI(TAG, "New Work Activated (slot %lu) %s (type %d)", (unsigned long)slot_notify, new_work->job_id, new_work->type);
-            current_work = new_work;
+            
+            // Controleer of dit daadwerkelijk een nieuwe job/template is (op basis van job_id)
+            if (current_work == NULL || strcmp(new_work->job_id, current_work->job_id) != 0) {
+                ESP_LOGI(TAG, "Nieuwe Block Template / Job Ontvangen: %s (slot %lu)", new_work->job_id, (unsigned long)slot_notify);
+                current_work = new_work;
+                current_version = new_work->version; // Pas bij een echt nieuw blok resetten we de versie
+                current_work_sent = false;
+            } else {
+                ESP_LOGI(TAG, "Zelfde job ID ontvangen, doorrollen op bestaande template");
+            }
+
             GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
-            current_work_sent = false;
-            current_version = new_work->version;
 
             if (new_work->version_mask != current_version_mask && GLOBAL_STATE->ASIC_initalized) {
                 ESP_LOGI(TAG, "Set chip version rolls %i", (int)(new_work->version_mask >> 13));
@@ -134,7 +141,7 @@ void create_jobs_task(void *pvParameters)
                 current_version_mask = new_work->version_mask;
             }
 
-            if (!current_work->clean_jobs) {
+            if (!current_work->clean_jobs && current_work_sent) {
                 // Staged job for next cycle, let current ASIC cycle finish
                 continue;
             }
@@ -143,7 +150,6 @@ void create_jobs_task(void *pvParameters)
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 continue;
             }
-            // De vroege afbreekvoorwaarde is hier verwijderd zodat het doorrollen doorgaat[span_1](start_span)[span_1](end_span).
         }
 
         generate_work_from_miner_job(GLOBAL_STATE, current_work, current_version);
@@ -152,7 +158,7 @@ void create_jobs_task(void *pvParameters)
         }
         current_work_sent = true;
 
-        // Blijf de versie continu ophogen totdat een nieuwe job wordt aangemeld[span_2](start_span)[span_2](end_span)
+        // Blijf de versie continu ophogen zolang er geen nieuwe blok-template binnenkomt
         uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
         uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
         if (midstates == 0) midstates = 1;
