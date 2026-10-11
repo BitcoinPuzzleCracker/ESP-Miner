@@ -1,8 +1,11 @@
 #include <sys/time.h>
 #include <limits.h>
 
+// -- TYP DEZE REGELS HANDMATIG OVER IN UW EDITOR --
 #include "work_queue.h"
 #include "global_state.h"
+// --------------------------------------------------
+
 #include "esp_log.h"
 #include "esp_system.h"
 #include "mining.h"
