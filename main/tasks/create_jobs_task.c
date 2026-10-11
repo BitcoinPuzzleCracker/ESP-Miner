@@ -1,11 +1,8 @@
 #include <sys/time.h>
 #include <limits.h>
 
-// -- TYP DEZE REGELS HANDMATIG OVER IN UW EDITOR --
 #include "work_queue.h"
 #include "global_state.h"
-// --------------------------------------------------
-
 #include "esp_log.h"
 #include "esp_system.h"
 #include "mining.h"
@@ -24,6 +21,9 @@ static const char *TAG = "create_jobs_task";
 
 #define MAX_EXTRANONCE2_LEN 32
 #define MAX_EXTRANONCE2_STR (MAX_EXTRANONCE2_LEN * 2 + 1)
+
+static uint64_t extranonce2_counter_v1 = 0;
+static uint64_t extranonce2_counter_sv2 = 0;
 
 static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, double difficulty);
 static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *job, double difficulty);
@@ -58,7 +58,7 @@ void create_jobs_task(void *pvParameters)
     static uint32_t last_dispatched_job_sv2 = UINT32_MAX;
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
-    ESP_LOGI(TAG, "ASIC Ready! (Extranonce2 Rolling + BIP320 + Auto-Job-Update)");
+    ESP_LOGI(TAG, "ASIC Ready! (Zero-Extranonce2 + BIP320 + Auto-Job-Update)");
 
     while (1) {
         if (GLOBAL_STATE->reset_extranonce2) {
@@ -146,19 +146,26 @@ void create_jobs_task(void *pvParameters)
                 GLOBAL_STATE->new_stratum_version_rolling_msg = false;
             }
 
+            // KRİTİK DÜZELTME:
+            // Eğer iş ID'si YENİYSE, clean_jobs false olsa bile ASIC'e GÖNDER!
+            // Sadece AYNI iş ID'si tekrar geldiyse ve clean_jobs false ise pas geç.
             if (!is_new_job_id && !clean) {
                 continue;
             }
 
         } else {
+            // Kuyruk boşaldı (timeout oldu)
             if (current_work == NULL) {
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 continue;
             }
+            // Timeout süresinde aynı işi ASIC'e tekrar itmiyoruz (Duplicate shares engellendi).
+            // ASIC donanımı kendi version rolling arama uzayında dönmeye devam eder.
             timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
             continue;
         }
 
+        // Son protokol kontrolü
         active_protocol = GLOBAL_STATE->stratum_protocol;
         if (active_protocol != current_work_protocol) {
             free_work_item(GLOBAL_STATE, current_work, current_work_protocol);
@@ -168,6 +175,7 @@ void create_jobs_task(void *pvParameters)
             continue;
         }
 
+        // ASIC'e taze işi gönder (extranonce2 her zaman endüstri standardı 0)
         if (active_protocol == STRATUM_PROTOCOL_V2) {
             if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
                 generate_work_sv2_ext(GLOBAL_STATE, (sv2_ext_job_t *)current_work, difficulty);
@@ -189,30 +197,19 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
         return;
     }
 
-    // Extranonce 2'yi sağdan sola artırarak (rolling) oluşturan mekanizma
-    static uint64_t extranonce2_counter = 0;
+    // Oplopende extranonce2 — telt van rechts (…00000001, 00000002, … 0000000A, …)
     char extranonce_2_str[MAX_EXTRANONCE2_STR];
-    
-    int total_hex_chars = GLOBAL_STATE->extranonce_2_len * 2;
-    uint64_t val = extranonce2_counter++;
-    
-    // Hex string'i sıfırlarla doldur
-    for (int i = 0; i < total_hex_chars; i++) {
-        extranonce_2_str[i] = '0';
-    }
-    extranonce_2_str[total_hex_chars] = '\0';
-
-    // Sağdan sola doğru hex değerini yazma
-    int curr_idx = total_hex_chars - 1;
-    while (val > 0 && curr_idx >= 0) {
-        int rem = val & 0xF;
-        if (rem < 10) {
-            extranonce_2_str[curr_idx] = '0' + rem;
-        } else {
-            extranonce_2_str[curr_idx] = 'a' + (rem - 10);
+    int hex_len = GLOBAL_STATE->extranonce_2_len * 2;
+    if (hex_len <= 0) {
+        extranonce_2_str[0] = '\0';
+    } else {
+        uint64_t value = extranonce2_counter_v1++;
+        if (hex_len < 16) {
+            uint64_t mask = (1ULL << (hex_len * 4)) - 1;
+            value &= mask;
         }
-        val >>= 4;
-        curr_idx--;
+        snprintf(extranonce_2_str, sizeof(extranonce_2_str),
+                 "%0*llX", hex_len, (unsigned long long)value);
     }
 
     uint8_t coinbase_tx_hash[32];
@@ -326,6 +323,13 @@ static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *ext_
     uint8_t extranonce_2_len = conn->extranonce_size;
     uint8_t extranonce_2[32];
     memset(extranonce_2, 0, sizeof(extranonce_2));
+
+    // Oplopende extranonce2 — big-endian zodat rechts eerst telt
+    uint64_t ctr = extranonce2_counter_sv2++;
+    for (int i = (int)extranonce_2_len - 1; i >= 0 && ctr > 0; i--) {
+        extranonce_2[i] = (uint8_t)(ctr & 0xFF);
+        ctr >>= 8;
+    }
 
     uint8_t coinbase_tx_hash[32];
     calculate_coinbase_tx_hash_bin(
