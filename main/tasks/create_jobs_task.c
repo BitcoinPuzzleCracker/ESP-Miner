@@ -130,7 +130,7 @@ void create_jobs_task(void *pvParameters)
             current_work_sent = false;
             current_version = new_work->version;
 
-            if (new_work->version_mask != current_version_mask && GLOBAL_STATE$ASIC_initalized) {
+            if (new_work->version_mask != current_version_mask && GLOBAL_STATE->ASIC_initalized) {
                 ESP_LOGI(TAG, "Set chip version rolls %i", (int)(new_work->version_mask >> 13));
                 ASIC_set_version_mask(GLOBAL_STATE, new_work->version_mask);
                 current_version_mask = new_work->version_mask;
