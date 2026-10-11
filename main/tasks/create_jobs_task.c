@@ -1,6 +1,5 @@
 #include <sys/time.h>
 #include <limits.h>
-#include <inttypes.h>
 
 #include "work_queue.h"
 #include "global_state.h"
@@ -23,9 +22,9 @@ static const char *TAG = "create_jobs_task";
 #define MAX_EXTRANONCE2_LEN 32
 #define MAX_EXTRANONCE2_STR (MAX_EXTRANONCE2_LEN * 2 + 1)
 
-static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, double difficulty, uint64_t extranonce_2);
+static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, double difficulty);
 static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *job, double difficulty);
-static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *job, double difficulty, uint64_t extranonce_2);
+static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *job, double difficulty);
 
 // Free a work item using the correct free function for the protocol it was created under
 static void free_work_item(GlobalState *GLOBAL_STATE, void *work, stratum_protocol_t protocol)
@@ -50,19 +49,17 @@ void create_jobs_task(void *pvParameters)
     void *current_work = NULL;
     stratum_protocol_t current_work_protocol = GLOBAL_STATE->stratum_protocol;
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
-    uint64_t extranonce_2 = 0;
 
     // En son ASIC'e gönderilen işin ID'sini takip eden hafıza
     static char last_dispatched_job_v1[64] = {0};
     static uint32_t last_dispatched_job_sv2 = UINT32_MAX;
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
-    ESP_LOGI(TAG, "ASIC Ready! (Extranonce2 Rolling + BIP320 Midstates + Auto-Job-Update)");
+    ESP_LOGI(TAG, "ASIC Ready! (Extranonce2 Rolling + BIP320 + Auto-Job-Update)");
 
     while (1) {
         if (GLOBAL_STATE->reset_extranonce2) {
             GLOBAL_STATE->reset_extranonce2 = false;
-            extranonce_2 = 0;
         }
 
         // Protokol değişim kontrolü
@@ -78,7 +75,6 @@ void create_jobs_task(void *pvParameters)
             current_work_protocol = active_protocol;
             last_dispatched_job_v1[0] = '\0';
             last_dispatched_job_sv2 = UINT32_MAX;
-            extranonce_2 = 0;
         }
 
         uint64_t start_time = esp_timer_get_time();
@@ -90,7 +86,7 @@ void create_jobs_task(void *pvParameters)
 
             // Önceki işi bellekten temizle
             free_work_item(GLOBAL_STATE, current_work, current_work_protocol);
-            current_work = new_work;
+            current_work = NULL;
 
             if (active_protocol != current_work_protocol) {
                 ESP_LOGW(TAG, "Protocol switch detected during dequeue, discarding stale item");
@@ -99,6 +95,8 @@ void create_jobs_task(void *pvParameters)
                 timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
                 continue;
             }
+
+            current_work = new_work;
 
             // Loglama ve İş ID Takibi
             bool is_new_job_id = false;
@@ -145,24 +143,19 @@ void create_jobs_task(void *pvParameters)
                 GLOBAL_STATE->new_stratum_version_rolling_msg = false;
             }
 
-            if (is_new_job_id || clean) {
-                extranonce_2 = 0; // Yeni işte extranonce2'yi sıfırla
+            if (!is_new_job_id && !clean) {
+                continue;
             }
 
         } else {
-            // Kuyruk boşaldı (timeout oldu) - aynı iş üzerinde extranonce_2 artırılarak devam edilir
             if (current_work == NULL) {
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 continue;
             }
-            extranonce_2++;
-            if (extranonce_2 > 0xFFFFFFFFFFFFFFFFULL) {
-                extranonce_2 = 0;
-            }
             timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
+            continue;
         }
 
-        // Son protokol kontrolü
         active_protocol = GLOBAL_STATE->stratum_protocol;
         if (active_protocol != current_work_protocol) {
             free_work_item(GLOBAL_STATE, current_work, current_work_protocol);
@@ -172,40 +165,51 @@ void create_jobs_task(void *pvParameters)
             continue;
         }
 
-        // ASIC'e işi gönder (Extranonce2 artan değerle ve optimize midstate rolling ile)
         if (active_protocol == STRATUM_PROTOCOL_V2) {
             if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
-                generate_work_sv2_ext(GLOBAL_STATE, (sv2_ext_job_t *)current_work, difficulty, extranonce_2);
+                generate_work_sv2_ext(GLOBAL_STATE, (sv2_ext_job_t *)current_work, difficulty);
             } else {
                 generate_work_sv2(GLOBAL_STATE, (sv2_job_t *)current_work, difficulty);
             }
         } else {
-            generate_work(GLOBAL_STATE, (mining_notify *)current_work, difficulty, extranonce_2);
+            generate_work(GLOBAL_STATE, (mining_notify *)current_work, difficulty);
         }
 
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
     }
 }
 
-static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, double difficulty, uint64_t extranonce_2)
+static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, double difficulty)
 {
     if (GLOBAL_STATE->extranonce_2_len > MAX_EXTRANONCE2_LEN) {
         ESP_LOGE(TAG, "extranonce_2_len %d exceeds maximum %d, skipping job", GLOBAL_STATE->extranonce_2_len, MAX_EXTRANONCE2_LEN);
         return;
     }
 
-    char extranonce_2_str[MAX_EXTRANONCE2_STR] = "";
-    uint8_t extranonce_2_bin[MAX_EXTRANONCE2_LEN] = {0};
-    size_t e2_len = GLOBAL_STATE->extranonce_2_len;
+    // Extranonce 2'yi sağdan sola artırarak (rolling) oluşturan mekanizma
+    static uint64_t extranonce2_counter = 0;
+    char extranonce_2_str[MAX_EXTRANONCE2_STR];
+    
+    int total_hex_chars = GLOBAL_STATE->extranonce_2_len * 2;
+    uint64_t val = extranonce2_counter++;
+    
+    // Hex string'i sıfırlarla doldur
+    for (int i = 0; i < total_hex_chars; i++) {
+        extranonce_2_str[i] = '0';
+    }
+    extranonce_2_str[total_hex_chars] = '\0';
 
-    if (e2_len > 0) {
-        uint64_t val = extranonce_2;
-        size_t copy_len = (e2_len < sizeof(uint64_t)) ? e2_len : sizeof(uint64_t);
-        for (int i = (int)copy_len - 1; i >= 0; i--) {
-            extranonce_2_bin[i] = (uint8_t)(val & 0xFF);
-            val >>= 8;
+    // Sağdan sola doğru hex değerini yazma
+    int curr_idx = total_hex_chars - 1;
+    while (val > 0 && curr_idx >= 0) {
+        int rem = val & 0xF;
+        if (rem < 10) {
+            extranonce_2_str[curr_idx] = '0' + rem;
+        } else {
+            extranonce_2_str[curr_idx] = 'a' + (rem - 10);
         }
-        bin2hex(extranonce_2_bin, e2_len, extranonce_2_str, sizeof(extranonce_2_str));
+        val >>= 4;
+        curr_idx--;
     }
 
     uint8_t coinbase_tx_hash[32];
@@ -303,7 +307,7 @@ static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *sv2_job, dou
     ASIC_send_work(GLOBAL_STATE, next_job);
 }
 
-static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *ext_job, double difficulty, uint64_t extranonce_2_val)
+static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *ext_job, double difficulty)
 {
     sv2_conn_t *conn = GLOBAL_STATE->sv2_conn;
     if (!conn) return;
@@ -317,15 +321,8 @@ static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *ext_
     uint32_t version_mask = GLOBAL_STATE->version_mask;
 
     uint8_t extranonce_2_len = conn->extranonce_size;
-    uint8_t extranonce_2[32] = {0};
-    if (extranonce_2_len > 0) {
-        uint64_t val = extranonce_2_val;
-        size_t copy_len = (extranonce_2_len < sizeof(uint64_t)) ? extranonce_2_len : sizeof(uint64_t);
-        for (int i = (int)copy_len - 1; i >= 0; i--) {
-            extranonce_2[i] = (uint8_t)(val & 0xFF);
-            val >>= 8;
-        }
-    }
+    uint8_t extranonce_2[32];
+    memset(extranonce_2, 0, sizeof(extranonce_2));
 
     uint8_t coinbase_tx_hash[32];
     calculate_coinbase_tx_hash_bin(
