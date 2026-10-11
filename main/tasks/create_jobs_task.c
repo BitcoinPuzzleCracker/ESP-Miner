@@ -5,7 +5,6 @@
 #include "global_state.h"
 #include "esp_log.h"
 #include "esp_system.h"
-#include "esp_random.h"
 #include "mining.h"
 #include "miner_job.h"
 #include "string.h"
@@ -21,7 +20,7 @@ static const char *TAG = "create_jobs_task";
 #define MAX_EXTRANONCE2_LEN 32
 #define MAX_EXTRANONCE2_STR (MAX_EXTRANONCE2_LEN * 2 + 1)
 
-static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_job_t *job, uint32_t current_version)
+static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_job_t *job, uint64_t extranonce_2, uint32_t current_version)
 {
     if (!job) return;
 
@@ -54,12 +53,12 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
 
         uint8_t extranonce_2_bin[MAX_EXTRANONCE2_LEN] = {0};
         if (e2_len > 0) {
-            for (size_t i = 0; i < e2_len; i += 4) {
-                uint32_t rand_val = esp_random();
-                size_t chunk = (e2_len - i < 4) ? (e2_len - i) : 4;
-                for (size_t j = 0; j < chunk; j++) {
-                    extranonce_2_bin[i + j] = (rand_val >> (8 * j)) & 0xFF;
-                }
+            // Big Endian opslag zodat extranonce_2 sequentieel oploopt (bijv. 00000001 i.p.v. 10000000 op Little Endian)
+            uint64_t val = extranonce_2;
+            size_t copy_len = (e2_len < sizeof(uint64_t)) ? e2_len : sizeof(uint64_t);
+            for (int i = (int)copy_len - 1; i >= 0; i--) {
+                extranonce_2_bin[i] = (uint8_t)(val & 0xFF);
+                val >>= 8;
             }
             bin2hex(extranonce_2_bin, e2_len, extranonce_2_str, sizeof(extranonce_2_str));
         }
@@ -103,14 +102,14 @@ void create_jobs_task(void *pvParameters)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
 
+    // active_jobs / valid_jobs are allocated and zeroed by SYSTEM_init_system(),
+    // before any task that touches them can run.
+
     uint32_t current_version_mask = 0;
     miner_job_t *current_work = NULL;
     bool current_work_sent = false;
+    uint64_t extranonce_2 = 0;
     uint32_t current_version = 0;
-    
-    char last_prevhash[64] = {0};
-    bool has_last_prevhash = false;
-
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
@@ -125,39 +124,22 @@ void create_jobs_task(void *pvParameters)
 
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
-            
-            bool is_new_block = false;
-            if (new_work->prev_hash) {
-                if (!has_last_prevhash || strcmp(new_work->prev_hash, last_prevhash) != 0) {
-                    is_new_block = true;
-                    strncpy(last_prevhash, new_work->prev_hash, sizeof(last_prevhash) - 1);
-                    has_last_prevhash = true;
-                }
-            } else {
-                if (new_work->clean_jobs) {
-                    is_new_block = true;
-                }
-            }
-
-            if (is_new_block) {
-                ESP_LOGI(TAG, ">>> ECHT NIEUW BLOK ONTVANGEN! Versie en rolling worden gereset.");
-                current_work = new_work;
-                current_version = new_work->version;
-                current_work_sent = false;
-            } else {
-                ESP_LOGI(TAG, "Tussentijdse job-update genegeerd voor reset, doorrollen op huidige template.");
-                current_work = new_work;
-            }
-
+            ESP_LOGI(TAG, "New Work Activated (slot %lu) %s (type %d)", (unsigned long)slot_notify, new_work->job_id, new_work->type);
+            current_work = new_work;
             GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
+            current_work_sent = false;
+            current_version = new_work->version;
 
-            if (new_work->version_mask != current_version_mask && GLOBAL_STATE->ASIC_initalized) {
+            if (new_work->version_mask != current_version_mask && GLOBAL_STATE$ASIC_initalized) {
                 ESP_LOGI(TAG, "Set chip version rolls %i", (int)(new_work->version_mask >> 13));
                 ASIC_set_version_mask(GLOBAL_STATE, new_work->version_mask);
                 current_version_mask = new_work->version_mask;
             }
 
-            if (!current_work->clean_jobs && current_work_sent && !is_new_block) {
+            extranonce_2 = 0;
+
+            if (!current_work->clean_jobs) {
+                // Staged job for next cycle, let current ASIC cycle finish
                 continue;
             }
         } else {
@@ -165,22 +147,32 @@ void create_jobs_task(void *pvParameters)
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 continue;
             }
+            if (!miner_job_is_rollable(current_work) && current_work_sent && GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
+                timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
+                continue;
+            }
         }
 
-        generate_work_from_miner_job(GLOBAL_STATE, current_work, current_version);
+        generate_work_from_miner_job(GLOBAL_STATE, current_work, extranonce_2, current_version);
         if (!current_work_sent) {
             SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
         }
         current_work_sent = true;
 
-        uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
-        uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
-        if (midstates == 0) midstates = 1;
-
-        for (int i = 0; i < midstates; i++) {
-            current_version = increment_bitmask(current_version, mask);
+        if (miner_job_is_rollable(current_work)) {
+            extranonce_2++;
+            // Kısa döngüye sıkışmayı önlemek için genişletilmiş rollover aralığı
+            if (extranonce_2 > 0xFFFFFFFFFFFFFFFFULL) {
+                extranonce_2 = 0;
+            }
+        } else if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
+            // Software version rolling for ASICs without hardware version rolling (e.g. BM1397) on SV2 Standard Channel
+            uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
+            uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
+            for (int i = 0; i < midstates; i++) {
+                current_version = increment_bitmask(current_version, mask);
+            }
         }
-
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
     }
 }
